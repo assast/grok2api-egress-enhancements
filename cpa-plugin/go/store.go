@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -264,32 +265,73 @@ func (s *stateStore) getNode(id string) (*nodeRecord, bool) {
 }
 
 func (s *stateStore) createNode(name, proxyURL string, enabled, pool bool, capacity int) (*nodeRecord, error) {
+	items, err := s.createNodes(name, []string{proxyURL}, enabled, pool, capacity)
+	if err != nil {
+		return nil, err
+	}
+	return items[0], nil
+}
+
+// createNodes creates one node per proxy URL. A single URL keeps baseName as-is;
+// multiple URLs append a zero-padded suffix (name-01, name-02, ...).
+func (s *stateStore) createNodes(baseName string, proxyURLs []string, enabled, pool bool, capacity int) ([]*nodeRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if name == "" || proxyURL == "" {
+	baseName = strings.TrimSpace(baseName)
+	proxies := uniqueNonEmpty(proxyURLs)
+	if baseName == "" || len(proxies) == 0 {
 		return nil, fmt.Errorf("名称和代理 URL 必填")
 	}
-	id := fmt.Sprintf("%d", s.data.NextID)
-	s.data.NextID++
 	now := time.Now().UTC()
-	n := &nodeRecord{
-		ID:              id,
-		Name:            name,
-		ProxyURL:        proxyURL,
-		ProxyURLStored:  proxyURL,
-		Enabled:         enabled,
-		ProxyPool:       pool,
-		AccountCapacity: capacity,
-		ProbeStatus:     "unknown",
-		CreatedAt:       now,
-		UpdatedAt:       now,
+	width := len(fmt.Sprintf("%d", len(proxies)))
+	if width < 2 {
+		width = 2
 	}
-	s.data.Nodes[id] = n
+	out := make([]*nodeRecord, 0, len(proxies))
+	for i, proxyURL := range proxies {
+		name := baseName
+		if len(proxies) > 1 {
+			name = fmt.Sprintf("%s-%0*d", baseName, width, i+1)
+		}
+		id := fmt.Sprintf("%d", s.data.NextID)
+		s.data.NextID++
+		n := &nodeRecord{
+			ID:              id,
+			Name:            name,
+			ProxyURL:        proxyURL,
+			ProxyURLStored:  proxyURL,
+			Enabled:         enabled,
+			ProxyPool:       pool,
+			AccountCapacity: capacity,
+			ProbeStatus:     "unknown",
+			CreatedAt:       now,
+			UpdatedAt:       now,
+		}
+		s.data.Nodes[id] = n
+		cp := *n
+		out = append(out, &cp)
+	}
 	if err := s.persistLocked(); err != nil {
 		return nil, err
 	}
-	cp := *n
-	return &cp, nil
+	return out, nil
+}
+
+func uniqueNonEmpty(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func (s *stateStore) updateNode(id string, mut func(*nodeRecord) error) (*nodeRecord, error) {

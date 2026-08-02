@@ -70,9 +70,44 @@ func TestStoreNodeCRUD(t *testing.T) {
 	}
 }
 
+func TestCreateNodesBatch(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	items, err := s.createNodes("pool", []string{
+		"socks5h://u:p@1.example:1080",
+		"",
+		"socks5h://u:p@2.example:1080",
+		"socks5h://u:p@1.example:1080", // duplicate ignored
+		"socks5h://u:p@3.example:1080",
+	}, true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("len=%d want 3", len(items))
+	}
+	if items[0].Name != "pool-01" || items[1].Name != "pool-02" || items[2].Name != "pool-03" {
+		t.Fatalf("names %#v", []string{items[0].Name, items[1].Name, items[2].Name})
+	}
+	if items[0].ProxyURL != "socks5h://u:p@1.example:1080" {
+		t.Fatalf("proxy %q", items[0].ProxyURL)
+	}
+}
+
+func TestCollectProxyURLs(t *testing.T) {
+	got := collectProxyURLs(map[string]any{
+		"proxyURL": "socks5h://a\n\nsocks5h://b\r\nsocks5h://a",
+		"proxyURLs": []any{"socks5h://c", "  socks5h://b  "},
+	})
+	want := []string{"socks5h://c", "socks5h://b", "socks5h://a"}
+	// uniqueNonEmpty preserves first-seen: proxyURLs first, then proxyURL lines
+	if len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("got %#v want %#v", got, want)
+	}
+}
+
 func TestRenderStatusPage(t *testing.T) {
 	page := strings.Replace(pageTemplate, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
-	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "X-Grok2API-Egress-UI"} {
+	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "X-Grok2API-Egress-UI", "一行一个", "proxyURLs"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("missing %q", want)
 		}

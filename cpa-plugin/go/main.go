@@ -394,10 +394,7 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			var raw map[string]any
 			_ = json.Unmarshal(body, &raw)
 			name, _ := raw["name"].(string)
-			proxy, _ := raw["proxyURL"].(string)
-			if proxy == "" {
-				proxy, _ = raw["proxy_url"].(string)
-			}
+			proxies := collectProxyURLs(raw)
 			enabled := true
 			if v, ok := raw["enabled"].(bool); ok {
 				enabled = v
@@ -407,11 +404,18 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 				pool, _ = raw["proxy_pool"].(bool)
 			}
 			cap := intPick(raw, 0, "accountCapacity", "account_capacity")
-			n, err := store.createNode(strings.TrimSpace(name), strings.TrimSpace(proxy), enabled, pool, cap)
+			items, err := store.createNodes(strings.TrimSpace(name), proxies, enabled, pool, cap)
 			if err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("createFailed", err.Error()))
 			}
-			return managementJSON(http.StatusOK, map[string]any{"data": publicNode(n)})
+			out := make([]map[string]any, 0, len(items))
+			for _, n := range items {
+				out = append(out, publicNode(n))
+			}
+			if len(out) == 1 {
+				return managementJSON(http.StatusOK, map[string]any{"data": out[0], "items": out, "created": 1})
+			}
+			return managementJSON(http.StatusOK, map[string]any{"data": map[string]any{"items": out, "total": len(out)}, "items": out, "created": len(out)})
 		}
 		if method == http.MethodDelete {
 			var raw map[string]any
@@ -671,6 +675,33 @@ func stringIDs(v any) []string {
 		out = append(out, t...)
 	}
 	return out
+}
+
+// collectProxyURLs accepts proxyURL / proxy_url as a single string (multi-line OK)
+// and proxyURLs / proxy_urls as a string array. Empty lines are skipped; duplicates
+// are de-duplicated while preserving first-seen order.
+func collectProxyURLs(raw map[string]any) []string {
+	var chunks []string
+	for _, key := range []string{"proxyURLs", "proxy_urls"} {
+		if v, ok := raw[key]; ok {
+			chunks = append(chunks, stringIDs(v)...)
+		}
+	}
+	for _, key := range []string{"proxyURL", "proxy_url"} {
+		if s, ok := raw[key].(string); ok && s != "" {
+			chunks = append(chunks, s)
+		}
+	}
+	var lines []string
+	for _, chunk := range chunks {
+		for _, line := range strings.Split(chunk, "\n") {
+			line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+			if line != "" {
+				lines = append(lines, line)
+			}
+		}
+	}
+	return uniqueNonEmpty(lines)
 }
 
 func intPick(raw map[string]any, def int, keys ...string) int {

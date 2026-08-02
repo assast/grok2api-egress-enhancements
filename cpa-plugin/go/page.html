@@ -11,7 +11,7 @@
     * { box-sizing: border-box; border-color: var(--border); }
     html, body { margin: 0; min-width: 0; overflow-x: clip; background: var(--background); color: var(--foreground); }
     body { font-family: var(--font-body); font-size: var(--text-md); line-height: 1.5; -webkit-font-smoothing: antialiased; }
-    button, input, select { font: inherit; }
+    button, input, select, textarea { font: inherit; }
     button { white-space: nowrap; }
     [hidden] { display: none !important; }
     .shell { width: min(100%, 1440px); margin: 0 auto; padding: var(--space-md); }
@@ -29,7 +29,7 @@
     .button { min-height: 2.25rem; display: inline-flex; align-items: center; justify-content: center; gap: var(--space-3xs); border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-sm); padding: 0 var(--space-xs); background: var(--secondary); color: var(--secondary-foreground); font-size: var(--text-xs); font-weight: 600; line-height: 1; cursor: pointer; transition: background var(--dur-short) var(--ease-out), color var(--dur-short) var(--ease-out), opacity var(--dur-short) var(--ease-out), transform var(--dur-fast) var(--ease-out); }
     .button:hover { background: var(--accent); color: var(--accent-foreground); }
     .button:active { transform: translateY(1px); }
-    .button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+    .button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
     .button:disabled { opacity: 0.48; cursor: not-allowed; transform: none; }
     .button.primary { background: var(--primary); color: var(--primary-foreground); border-color: var(--primary); }
     .button.primary:hover { opacity: 0.9; }
@@ -53,11 +53,12 @@
     .section-head p { margin: var(--space-3xs) 0 0; color: var(--muted-foreground); font-size: var(--text-xs); }
     .toolbar { flex-wrap: wrap; justify-content: flex-end; }
     .search { width: min(16rem, 100%); }
-    input, select { min-height: 2.25rem; width: 100%; border: var(--rule-hairline) solid var(--input); border-radius: var(--radius-sm); padding: 0 var(--space-xs); background: var(--background); color: var(--foreground); }
-    input:hover, select:hover { border-color: var(--ring); }
-    input:user-invalid, select:user-invalid { border-color: var(--destructive); background: var(--danger-surface); }
-    input:disabled, select:disabled { opacity: 0.55; cursor: not-allowed; background: var(--muted); }
-    input::placeholder { color: var(--muted-foreground); }
+    input, select, textarea { min-height: 2.25rem; width: 100%; border: var(--rule-hairline) solid var(--input); border-radius: var(--radius-sm); padding: 0 var(--space-xs); background: var(--background); color: var(--foreground); }
+    textarea { min-height: 7.5rem; padding: var(--space-2xs) var(--space-xs); resize: vertical; line-height: 1.45; font-family: var(--font-mono); }
+    input:hover, select:hover, textarea:hover { border-color: var(--ring); }
+    input:user-invalid, select:user-invalid, textarea:user-invalid { border-color: var(--destructive); background: var(--danger-surface); }
+    input:disabled, select:disabled, textarea:disabled { opacity: 0.55; cursor: not-allowed; background: var(--muted); }
+    input::placeholder, textarea::placeholder { color: var(--muted-foreground); }
     input[type="checkbox"] { width: 1rem; min-height: 1rem; accent-color: var(--primary); }
     .batch-bar { min-height: 3rem; display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm); padding: var(--space-2xs) var(--space-sm); border-bottom: var(--rule-hairline) solid var(--border); background: var(--muted); }
     .batch-bar span { font-size: var(--text-xs); color: var(--muted-foreground); }
@@ -248,9 +249,9 @@
       <form id="node-form">
         <div class="modal-body form-grid">
           <div class="field full check-row"><label for="node-enabled">启用节点</label><input id="node-enabled" type="checkbox" checked></div>
-          <div class="field"><label for="node-name">名称</label><input id="node-name" required maxlength="120" autocomplete="off" placeholder="例如 grok-build-sticky-04"></div>
+          <div class="field"><label for="node-name">名称</label><input id="node-name" required maxlength="120" autocomplete="off" placeholder="例如 grok-build-sticky-04"><p class="help">批量导入多行代理时作为前缀</p></div>
           <div class="field"><label for="node-capacity">账号容量</label><input id="node-capacity" type="number" min="0" max="100000" value="0"><p class="help">0 表示不限制</p></div>
-          <div class="field full"><label for="node-proxy">代理 URL</label><input id="node-proxy" type="password" autocomplete="new-password" placeholder="socks5h://user:pass@host:port"><p id="node-proxy-help" class="help">创建节点时必填；编辑时留空表示保留现有代理</p></div>
+          <div class="field full"><label for="node-proxy">代理 URL</label><textarea id="node-proxy" rows="5" spellcheck="false" autocomplete="off" placeholder="socks5h://user:pass@host:port&#10;一行一个，可粘贴多行批量导入"></textarea><p id="node-proxy-help" class="help">创建时必填，支持多行（一行一个）；批量导入时名称作为前缀。编辑时留空表示保留现有代理</p></div>
           <div class="field full check-row"><div><label for="node-pool">代理池模式</label><p class="help">动态轮换代理开启；静态或固定代理关闭</p></div><input id="node-pool" type="checkbox"></div>
         </div>
         <div class="modal-actions"><button class="button" type="button" data-close="node-modal">取消</button><button id="save-node" class="button primary" type="submit">保存</button></div>
@@ -532,6 +533,10 @@
       $('node-pool').checked = Boolean(node?.proxyPool);
       $('node-proxy').value = '';
       $('node-proxy').required = !node;
+      $('node-proxy').rows = node ? 2 : 5;
+      $('node-proxy-help').textContent = node
+        ? '编辑时只支持单个代理 URL；留空表示保留现有代理'
+        : '创建时必填，支持多行（一行一个）；批量导入时名称作为前缀自动生成 name-01、name-02…';
       openModal('node-modal');
     }
     function openPolicy() {
@@ -639,15 +644,24 @@
     });
     $('node-form').addEventListener('submit', async (event) => {
       event.preventDefault();
-      const button = $('save-node'); const proxyURL = $('node-proxy').value.trim();
+      const button = $('save-node');
+      const proxyLines = $('node-proxy').value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
       const body = {name:$('node-name').value.trim(),enabled:$('node-enabled').checked,proxyPool:$('node-pool').checked,accountCapacity:Number($('node-capacity').value || 0)};
-      if (proxyURL) body.proxyURL = proxyURL;
-      if (!body.name || (!state.editing && !proxyURL)) { toast('请填写名称和代理 URL', 'error'); return; }
+      if (state.editing) {
+        if (proxyLines.length > 1) { toast('编辑节点时只能填写一个代理 URL', 'error'); return; }
+        if (proxyLines[0]) body.proxyURL = proxyLines[0];
+        if (!body.name) { toast('请填写名称', 'error'); return; }
+      } else {
+        if (!body.name || !proxyLines.length) { toast('请填写名称和代理 URL', 'error'); return; }
+        body.proxyURLs = proxyLines;
+      }
       busy(button, true);
       try {
         const path = state.editing ? '/nodes/' + encodeURIComponent(state.editing.id) : '/nodes';
-        await api(path, {method: state.editing ? 'PUT' : 'POST', body});
-        toast(state.editing ? '节点已更新' : '节点已添加'); closeModal('node-modal'); await load(true);
+        const result = await api(path, {method: state.editing ? 'PUT' : 'POST', body});
+        const created = Number(result?.created || result?.data?.total || proxyLines.length || 1);
+        toast(state.editing ? '节点已更新' : (created > 1 ? ('已批量添加 ' + created + ' 个节点') : '节点已添加'));
+        closeModal('node-modal'); await load(true);
       } catch (error) { toast(error.message, 'error'); }
       finally { busy(button, false); }
     });
