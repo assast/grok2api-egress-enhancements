@@ -8,7 +8,7 @@
 | | |
 |---|---|
 | 插件名 | `grok2api-egress` |
-| 当前版本 | **1.0.3** |
+| 当前版本 | **1.0.4** |
 | 语言 | Go (`-buildmode=c-shared` → `.so`) |
 | CPA SDK | `CLIProxyAPI/v7` (`pluginabi` / `pluginapi`) |
 | 能力 | Management UI + Usage Plugin |
@@ -77,6 +77,7 @@
 | 连通性测试 | 经该出口探测外网出口 IP / 延迟 |
 | 质量测试 | 真实 chat 探测，计算 output Token/s |
 | 绑定账号 | 查看粘在该节点 `proxy_url` 上的账号列表 |
+| 剔重出口 IP | 先预览再确认；同一出口 IP 只保留数值最小的节点 ID，并改绑其余节点账号 |
 | 批量启停 / 删除 | 删除前自动解绑 proxy |
 
 ### 账号粘性与调度
@@ -118,6 +119,7 @@
 - `min_healthy_nodes`：低于阈值则 **suppressed**，避免全军覆没
 - `minGenMs = 200`：极短生成窗口不虚高 TPS，降低 loadtest / 短回复误隔离
 - 极小 `output_tokens`（&lt;32）不做 hard 判定
+- 上游 HTTP 429 账号策略：默认冷却命中账号 24 小时；也可改为直接删除。冷却账号只会跳过质量探测，不计入节点质量错误，也不会隔离出口节点。
 
 ### 管理 UI
 
@@ -250,6 +252,7 @@ Content-Type: application/json
 | `/nodes/batch` | PATCH | 批量启停 |
 | `/nodes/test` | POST | 批量连通测试 |
 | `/nodes/rebalance` | POST | 账号重平衡 |
+| `/nodes/deduplicate-exit-ips` | POST | 预览或确认剔除重复出口 IP 节点 |
 | `/nodes/{id}` | GET/PUT/DELETE | 单节点 |
 | `/nodes/{id}/test` | POST | 连通测试 |
 | `/nodes/{id}/quality-test` | POST | 质量探测 |

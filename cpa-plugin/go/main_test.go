@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestComputeTPSUsesGenerationWindow(t *testing.T) {
@@ -33,6 +34,66 @@ func TestClassifyTPS(t *testing.T) {
 	}
 	if classifyTPS(100, 500, 1000) != "healthy" {
 		t.Fatal("expected healthy")
+	}
+}
+
+func TestHTTP429AccountActionDefaultsToCooldown(t *testing.T) {
+	if got := defaultPolicy().HTTP429AccountAction; got != http429AccountActionCooldown24 {
+		t.Fatalf("default HTTP 429 action = %q, want %q", got, http429AccountActionCooldown24)
+	}
+	if !isAccountRateLimited(http.StatusTooManyRequests) {
+		t.Fatal("HTTP 429 must use the account handling policy")
+	}
+	if isAccountRateLimited(http.StatusBadGateway) {
+		t.Fatal("non-429 response must not use the account handling policy")
+	}
+}
+
+func TestExitIPDedupPlanKeepsSmallestNodeID(t *testing.T) {
+	nodes := []*nodeRecord{
+		{ID: "12", Name: "later", ExitIP: "203.0.113.9"},
+		{ID: "2", Name: "first", ExitIP: "203.0.113.9"},
+		{ID: "7", Name: "unique", ExitIP: "203.0.113.10"},
+		{ID: "9", Name: "unknown"},
+	}
+	groups := planExitIPDedup(nodes)
+	if len(groups) != 1 {
+		t.Fatalf("groups = %#v, want one duplicate group", groups)
+	}
+	if groups[0].ExitIP != "203.0.113.9" || groups[0].KeepID != "2" || len(groups[0].DeleteIDs) != 1 || groups[0].DeleteIDs[0] != "12" {
+		t.Fatalf("unexpected dedup plan %#v", groups[0])
+	}
+}
+
+func TestAccountCooldownSurvivesReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := newStateStore(path)
+	auth := authFile{Name: "xai-limited.json"}
+	if _, err := s.coolAccountFor(auth, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if !s.isAccountCooling(auth, time.Now()) {
+		t.Fatal("account must be skipped while its 429 cooldown is active")
+	}
+	if !newStateStore(path).isAccountCooling(auth, time.Now()) {
+		t.Fatal("account cooldown must survive plugin restart")
+	}
+}
+
+func TestAccountLimitedResultDoesNotAffectNodeQuality(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := s.createNode("channel", "http://127.0.0.1:1", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyObservation(s, node.ID, "active", qualityResult{Classification: "account_limited", Error: "账号已冷却"})
+	updated, ok := s.getNode(node.ID)
+	if !ok || updated.ErrorStrikes != 0 || updated.DisabledByGuard {
+		t.Fatalf("429 account handling changed node state: %#v", updated)
+	}
+	stats := s.stats()
+	if stats.Active.Total != 1 || stats.Active.Errors != 0 {
+		t.Fatalf("unexpected active statistics: %#v", stats.Active)
 	}
 }
 
@@ -95,7 +156,7 @@ func TestCreateNodesBatch(t *testing.T) {
 
 func TestCollectProxyURLs(t *testing.T) {
 	got := collectProxyURLs(map[string]any{
-		"proxyURL": "socks5h://a\n\nsocks5h://b\r\nsocks5h://a",
+		"proxyURL":  "socks5h://a\n\nsocks5h://b\r\nsocks5h://a",
 		"proxyURLs": []any{"socks5h://c", "  socks5h://b  "},
 	})
 	want := []string{"socks5h://c", "socks5h://b", "socks5h://a"}
@@ -107,7 +168,7 @@ func TestCollectProxyURLs(t *testing.T) {
 
 func TestRenderStatusPage(t *testing.T) {
 	page := strings.Replace(pageTemplate, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
-	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "X-Grok2API-Egress-UI", "一行一个", "proxyURLs"} {
+	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "剔重出口 IP", "policy-429-account-action", "X-Grok2API-Egress-UI", "一行一个", "proxyURLs"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("missing %q", want)
 		}

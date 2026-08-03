@@ -224,6 +224,42 @@ func isAuthErrorRetryable(status int, body string) bool {
 		strings.Contains(lower, "x_xai_token_auth=none")
 }
 
+func isAccountRateLimited(status int) bool {
+	return status == http.StatusTooManyRequests
+}
+
+func applyHTTP429AccountPolicy(store *stateStore, node *nodeRecord, auth authFile, upstreamError string) string {
+	const cooldownDuration = 24 * time.Hour
+	pol := store.policy()
+	if pol.HTTP429AccountAction == http429AccountActionDelete {
+		reason := "egress-guard HTTP 429: " + upstreamError
+		if err := deleteAuthFile(auth, reason); err == nil {
+			store.appendEvent(guardEvent{
+				Event:    "account_429_deleted",
+				NodeID:   node.ID,
+				NodeName: node.Name,
+				AuthID:   auth.Name,
+				Reason:   "账号命中上游 HTTP 429，已删除",
+			})
+			return "账号 " + auth.Name + " 命中上游 HTTP 429，已删除"
+		} else {
+			upstreamError += "；删除账号失败，已改为冷却: " + err.Error()
+		}
+	}
+	until, err := store.coolAccountFor(auth, cooldownDuration)
+	if err != nil {
+		return "账号 " + auth.Name + " 命中上游 HTTP 429，但无法设置冷却: " + err.Error()
+	}
+	store.appendEvent(guardEvent{
+		Event:    "account_429_cooled",
+		NodeID:   node.ID,
+		NodeName: node.Name,
+		AuthID:   auth.Name,
+		Reason:   "账号命中上游 HTTP 429，冷却至 " + until.Format(time.RFC3339),
+	})
+	return "账号 " + auth.Name + " 命中上游 HTTP 429，已冷却 24 小时"
+}
+
 func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 	pol := store.policy()
 	res := qualityResult{Model: pol.Model}
@@ -238,11 +274,14 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		res.ExitIP = ip
 	}
 
-	candidates, err := listAuthsForNode(node, 8)
+	candidates, cooling, err := listProbeAuthsForNode(store, node, 8)
 	if err != nil || len(candidates) == 0 {
 		res.Classification = "error"
 		if err != nil {
 			res.Error = err.Error()
+		} else if cooling {
+			res.Classification = "account_limited"
+			res.Error = "该节点候选账号均处于 HTTP 429 冷却期"
 		} else {
 			res.Error = "没有可用的 CPA xAI 账号"
 		}
@@ -313,6 +352,11 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 			msg := fmt.Sprintf("上游 HTTP %d: %s", resp.StatusCode, truncate(string(b), 160))
 			lastErr = msg
 			res.DurationMs = time.Since(start).Milliseconds()
+			if isAccountRateLimited(resp.StatusCode) {
+				res.Classification = "account_limited"
+				res.Error = applyHTTP429AccountPolicy(store, node, auth, msg)
+				return res
+			}
 			if isAuthErrorRetryable(resp.StatusCode, string(b)) && i+1 < len(candidates) {
 				// try next account on same channel
 				continue

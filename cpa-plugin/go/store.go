@@ -6,9 +6,15 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	http429AccountActionDelete     = "delete_account"
+	http429AccountActionCooldown24 = "cooldown_24h"
 )
 
 type policyConfig struct {
@@ -24,6 +30,11 @@ type policyConfig struct {
 	Model                string  `json:"model"`
 	DisableAuthOnHard    bool    `json:"disable_auth_on_hard"`
 	MaxOutputTokensProbe int     `json:"max_output_tokens"`
+	HTTP429AccountAction string  `json:"http_429_account_action"`
+}
+
+type accountCooldown struct {
+	Until float64 `json:"until"`
 }
 
 type nodeRecord struct {
@@ -67,12 +78,12 @@ type guardEvent struct {
 }
 
 type probeStats struct {
-	Total         int64 `json:"total"`
-	Healthy       int64 `json:"healthy"`
-	Soft          int64 `json:"soft"`
-	Hard          int64 `json:"hard"`
-	Errors        int64 `json:"errors"`
-	OutputTokens  int64 `json:"output_tokens"`
+	Total        int64 `json:"total"`
+	Healthy      int64 `json:"healthy"`
+	Soft         int64 `json:"soft"`
+	Hard         int64 `json:"hard"`
+	Errors       int64 `json:"errors"`
+	OutputTokens int64 `json:"output_tokens"`
 }
 
 type actionStats struct {
@@ -89,13 +100,14 @@ type statistics struct {
 }
 
 type guardState struct {
-	Version  int                    `json:"version"`
-	Policy   policyConfig           `json:"policy"`
-	Nodes    map[string]*nodeRecord `json:"nodes"`
-	Events   []guardEvent           `json:"events"`
-	Stats    statistics             `json:"statistics"`
-	NextID   int                    `json:"next_id"`
-	UpdatedAt float64               `json:"updated_at"`
+	Version          int                        `json:"version"`
+	Policy           policyConfig               `json:"policy"`
+	Nodes            map[string]*nodeRecord     `json:"nodes"`
+	Events           []guardEvent               `json:"events"`
+	Stats            statistics                 `json:"statistics"`
+	AccountCooldowns map[string]accountCooldown `json:"account_cooldowns,omitempty"`
+	NextID           int                        `json:"next_id"`
+	UpdatedAt        float64                    `json:"updated_at"`
 }
 
 type stateStore struct {
@@ -118,18 +130,20 @@ func defaultPolicy() policyConfig {
 		Model:                "grok-4.5",
 		DisableAuthOnHard:    true,
 		MaxOutputTokensProbe: 384,
+		HTTP429AccountAction: http429AccountActionCooldown24,
 	}
 }
 
 func newStateStore(path string) *stateStore {
 	s := &stateStore{path: path}
 	s.data = guardState{
-		Version: 1,
-		Policy:  defaultPolicy(),
-		Nodes:   map[string]*nodeRecord{},
-		Events:  nil,
-		Stats:   statistics{StartedAt: float64(time.Now().Unix())},
-		NextID:  1,
+		Version:          1,
+		Policy:           defaultPolicy(),
+		Nodes:            map[string]*nodeRecord{},
+		Events:           nil,
+		Stats:            statistics{StartedAt: float64(time.Now().Unix())},
+		AccountCooldowns: map[string]accountCooldown{},
+		NextID:           1,
 	}
 	_ = s.load()
 	return s
@@ -152,11 +166,17 @@ func (s *stateStore) load() error {
 	if data.Nodes == nil {
 		data.Nodes = map[string]*nodeRecord{}
 	}
+	if data.AccountCooldowns == nil {
+		data.AccountCooldowns = map[string]accountCooldown{}
+	}
 	if data.NextID <= 0 {
 		data.NextID = 1
 	}
 	if data.Policy.HardTPS <= 0 {
 		data.Policy = defaultPolicy()
+	}
+	if data.Policy.HTTP429AccountAction == "" {
+		data.Policy.HTTP429AccountAction = http429AccountActionDelete
 	}
 	// hydrate private proxy field
 	for _, n := range data.Nodes {
@@ -233,8 +253,54 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 	if p.MinHealthyNodes <= 0 {
 		p.MinHealthyNodes = 1
 	}
+	if p.HTTP429AccountAction == "" {
+		p.HTTP429AccountAction = http429AccountActionDelete
+	}
+	if p.HTTP429AccountAction != http429AccountActionDelete && p.HTTP429AccountAction != http429AccountActionCooldown24 {
+		return fmt.Errorf("429 账号处理策略无效")
+	}
 	s.data.Policy = p
 	return s.persistLocked()
+}
+
+func accountCooldownKey(a authFile) string {
+	if name := filepath.Base(strings.TrimSpace(a.Name)); name != "" && name != "." {
+		return "name:" + name
+	}
+	return "index:" + strings.TrimSpace(a.Index)
+}
+
+func (s *stateStore) isAccountCooling(a authFile, now time.Time) bool {
+	key := accountCooldownKey(a)
+	if key == "index:" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cooldown, ok := s.data.AccountCooldowns[key]
+	if !ok || cooldown.Until <= float64(now.Unix()) {
+		if ok {
+			delete(s.data.AccountCooldowns, key)
+			_ = s.persistLocked()
+		}
+		return false
+	}
+	return true
+}
+
+func (s *stateStore) coolAccountFor(a authFile, duration time.Duration) (time.Time, error) {
+	key := accountCooldownKey(a)
+	if key == "index:" {
+		return time.Time{}, fmt.Errorf("账号缺少可持久化标识")
+	}
+	until := time.Now().Add(duration).UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.data.AccountCooldowns == nil {
+		s.data.AccountCooldowns = map[string]accountCooldown{}
+	}
+	s.data.AccountCooldowns[key] = accountCooldown{Until: float64(until.Unix())}
+	return until, s.persistLocked()
 }
 
 func (s *stateStore) listNodes() []*nodeRecord {
@@ -332,6 +398,46 @@ func uniqueNonEmpty(values []string) []string {
 		out = append(out, value)
 	}
 	return out
+}
+
+type exitIPDedupGroup struct {
+	ExitIP    string   `json:"exit_ip"`
+	KeepID    string   `json:"keep_id"`
+	DeleteIDs []string `json:"delete_ids"`
+}
+
+func nodeIDLess(left, right string) bool {
+	leftNumber, leftErr := strconv.ParseUint(left, 10, 64)
+	rightNumber, rightErr := strconv.ParseUint(right, 10, 64)
+	if leftErr == nil && rightErr == nil {
+		return leftNumber < rightNumber
+	}
+	return left < right
+}
+
+func planExitIPDedup(nodes []*nodeRecord) []exitIPDedupGroup {
+	byExitIP := map[string][]*nodeRecord{}
+	for _, node := range nodes {
+		if node == nil || strings.TrimSpace(node.ExitIP) == "" {
+			continue
+		}
+		ip := strings.TrimSpace(node.ExitIP)
+		byExitIP[ip] = append(byExitIP[ip], node)
+	}
+	groups := make([]exitIPDedupGroup, 0)
+	for exitIP, groupNodes := range byExitIP {
+		if len(groupNodes) < 2 {
+			continue
+		}
+		sort.Slice(groupNodes, func(i, j int) bool { return nodeIDLess(groupNodes[i].ID, groupNodes[j].ID) })
+		deleteIDs := make([]string, 0, len(groupNodes)-1)
+		for _, node := range groupNodes[1:] {
+			deleteIDs = append(deleteIDs, node.ID)
+		}
+		groups = append(groups, exitIPDedupGroup{ExitIP: exitIP, KeepID: groupNodes[0].ID, DeleteIDs: deleteIDs})
+	}
+	sort.Slice(groups, func(i, j int) bool { return groups[i].ExitIP < groups[j].ExitIP })
+	return groups
 }
 
 func (s *stateStore) updateNode(id string, mut func(*nodeRecord) error) (*nodeRecord, error) {
@@ -453,30 +559,30 @@ func publicNode(n *nodeRecord) map[string]any {
 		return nil
 	}
 	return map[string]any{
-		"id":                     n.ID,
-		"name":                   n.Name,
-		"enabled":                n.Enabled,
-		"proxyPool":              n.ProxyPool,
-		"accountCapacity":        n.AccountCapacity,
-		"exitIp":                 n.ExitIP,
-		"probeStatus":            n.ProbeStatus,
-		"probeLatencyMs":         n.ProbeLatencyMs,
-		"assignedAccountCount":   n.AssignedAccountCount,
-		"disabled_by_guard":      n.DisabledByGuard,
-		"quarantined_until":      n.QuarantinedUntil,
-		"error_strikes":          n.ErrorStrikes,
-		"soft_strikes":           n.SoftStrikes,
-		"last_classification":    n.LastClassification,
-		"last_output_tps":        n.LastOutputTPS,
-		"last_first_token_ms":    n.LastFirstTokenMs,
-		"last_duration_ms":       n.LastDurationMs,
-		"last_output_tokens":     n.LastOutputTokens,
-		"last_reason":            n.LastReason,
-		"last_source":            n.LastSource,
-		"last_observed_at":       n.LastObservedAt,
-		"last_probe_at":          n.LastProbeAt,
-		"hasProxy":               n.ProxyURL != "",
-		"createdAt":              n.CreatedAt,
-		"updatedAt":              n.UpdatedAt,
+		"id":                   n.ID,
+		"name":                 n.Name,
+		"enabled":              n.Enabled,
+		"proxyPool":            n.ProxyPool,
+		"accountCapacity":      n.AccountCapacity,
+		"exitIp":               n.ExitIP,
+		"probeStatus":          n.ProbeStatus,
+		"probeLatencyMs":       n.ProbeLatencyMs,
+		"assignedAccountCount": n.AssignedAccountCount,
+		"disabled_by_guard":    n.DisabledByGuard,
+		"quarantined_until":    n.QuarantinedUntil,
+		"error_strikes":        n.ErrorStrikes,
+		"soft_strikes":         n.SoftStrikes,
+		"last_classification":  n.LastClassification,
+		"last_output_tps":      n.LastOutputTPS,
+		"last_first_token_ms":  n.LastFirstTokenMs,
+		"last_duration_ms":     n.LastDurationMs,
+		"last_output_tokens":   n.LastOutputTokens,
+		"last_reason":          n.LastReason,
+		"last_source":          n.LastSource,
+		"last_observed_at":     n.LastObservedAt,
+		"last_probe_at":        n.LastProbeAt,
+		"hasProxy":             n.ProxyURL != "",
+		"createdAt":            n.CreatedAt,
+		"updatedAt":            n.UpdatedAt,
 	}
 }

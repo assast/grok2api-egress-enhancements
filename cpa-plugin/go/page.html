@@ -202,6 +202,7 @@
         <div class="toolbar">
           <input id="node-search" class="search" type="search" placeholder="搜索节点、IP 或 ID" aria-label="搜索节点">
           <button id="rebalance-nodes" class="button" type="button" title="按启用节点把 CPA 账号 proxy_url 重新均分">重平衡账号</button>
+          <button id="deduplicate-exit-ips" class="button danger" type="button" title="按出口 IP 剔重，每组仅保留最小 ID 的节点">剔重出口 IP</button>
           <button id="add-node" class="button primary" type="button">添加节点</button>
         </div>
       </div>
@@ -272,6 +273,7 @@
           <div class="field"><label for="policy-hard">硬阈值 Token/s</label><input id="policy-hard" type="number" min="2" max="10000" step="1"></div>
           <div class="field"><label for="policy-soft-count">连续软异常次数</label><input id="policy-soft-count" type="number" min="1" max="20"></div>
           <div class="field"><label for="policy-error-count">连续错误次数</label><input id="policy-error-count" type="number" min="1" max="20"></div>
+          <div class="field full"><label for="policy-429-account-action">上游 HTTP 429 账号处理</label><select id="policy-429-account-action"><option value="cooldown_24h">账号冷却 24 小时（默认；不计节点错误、不隔离节点）</option><option value="delete_account">直接删除命中账号</option></select><small>冷却策略只跳过质量探测，不改变 CPA 正常流量调度。</small></div>
           <div class="field full"><label for="policy-min-healthy">最低健康节点数</label><input id="policy-min-healthy" type="number" min="1" max="1000"></div>
         </div>
         <div class="modal-actions"><button class="button" type="button" data-close="policy-modal">取消</button><button id="save-policy" class="button primary" type="submit">保存策略</button></div>
@@ -305,6 +307,7 @@
     const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
     const number = (value) => new Intl.NumberFormat('zh-CN').format(Number(value || 0));
     const modeName = (mode) => ({active:'主动', passive:'被动', hybrid:'混合'})[mode] || '-';
+    const http429AccountActionName = (action) => ({delete_account:'直接删除账号', cooldown_24h:'冷却 24 小时'})[action] || '冷却 24 小时';
     const time = (value, epoch = false) => {
       if (!value) return '-';
       const date = epoch ? new Date(Number(value) * 1000) : new Date(value);
@@ -512,14 +515,14 @@
     function renderEvents() {
       const events = state.status?.recentEvents || [];
       if (!events.length) { $('events-list').innerHTML = '<div class="empty">暂无守护事件</div>'; return; }
-      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',node_rotated:'出口 IP 已轮换',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移'};
+      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',node_rotated:'出口 IP 已轮换',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',account_429_deleted:'429 账号已删除',account_429_cooled:'429 账号已冷却',exit_ip_deduplicated:'出口 IP 已剔重'};
       $('events-list').innerHTML = events.slice().reverse().map((event) => '<div class="event"><div><strong>' + esc(names[event.event] || event.event || '守护事件') + ' · ' + esc(event.node_name || ('节点 ' + event.node_id)) + '</strong><small>' + esc(event.reason || event.classification || '-') + (event.output_tps ? ' · ' + Number(event.output_tps).toFixed(1) + ' Token/s' : '') + '</small></div><time>' + relative(event.ts) + '</time></div>').join('');
     }
     function renderPolicy() {
       const cfg = state.status?.config;
       $('edit-policy').disabled = !cfg;
       if (!cfg) { $('policy-view').innerHTML = '<div class="empty">策略状态不可用</div>'; return; }
-      const values = [['模式',modeName(cfg.mode)],['主动间隔',cfg.active_interval_seconds + ' 秒'],['被动轮询',cfg.passive_poll_seconds + ' 秒'],['软 / 硬阈值',cfg.soft_tps + ' / ' + cfg.hard_tps],['连续异常',cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],['隔离复测',cfg.quarantine_seconds + ' 秒'],['最低健康节点',cfg.min_healthy_nodes],['模型',cfg.model]];
+      const values = [['模式',modeName(cfg.mode)],['主动间隔',cfg.active_interval_seconds + ' 秒'],['被动轮询',cfg.passive_poll_seconds + ' 秒'],['软 / 硬阈值',cfg.soft_tps + ' / ' + cfg.hard_tps],['连续异常',cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],['隔离复测',cfg.quarantine_seconds + ' 秒'],['429 账号处理',http429AccountActionName(cfg.http_429_account_action)],['最低健康节点',cfg.min_healthy_nodes],['模型',cfg.model]];
       $('policy-view').innerHTML = values.map((value) => '<div><dt>' + value[0] + '</dt><dd>' + esc(value[1]) + '</dd></div>').join('');
     }
     function openModal(id) { $(id).hidden = false; document.body.style.overflow = 'hidden'; $(id).querySelector('input,select,button')?.focus(); }
@@ -545,6 +548,7 @@
       $('policy-mode').value = cfg.mode; $('policy-active').value = cfg.active_interval_seconds; $('policy-passive').value = cfg.passive_poll_seconds;
       $('policy-quarantine').value = cfg.quarantine_seconds; $('policy-soft').value = cfg.soft_tps; $('policy-hard').value = cfg.hard_tps;
       $('policy-soft-count').value = cfg.consecutive_soft; $('policy-error-count').value = cfg.consecutive_errors; $('policy-min-healthy').value = cfg.min_healthy_nodes;
+      $('policy-429-account-action').value = cfg.http_429_account_action || 'cooldown_24h';
       openModal('policy-modal');
     }
     function confirmAction(title, message, action) {
@@ -566,6 +570,18 @@
     }
     async function testConnectivity(ids, button) {
       await mutate(button, () => api('/nodes/test', {method:'POST', body:{ids}}), '连通性检测完成');
+    }
+    async function deduplicateExitIPs(button) {
+      busy(button, true);
+      try {
+        const preview = await api('/nodes/deduplicate-exit-ips', {method:'POST', body:{}});
+        const groups = preview.groups || [];
+        const duplicateCount = Number(preview.duplicate_nodes || 0);
+        if (!groups.length || !duplicateCount) { toast('未发现重复出口 IP'); return; }
+        const summary = groups.map((group) => group.exit_ip + '：保留 ID ' + group.keep_id + '，剔除 ' + group.delete_ids.join('、')).join('；');
+        confirmAction('确认剔重出口 IP', '将剔除 ' + duplicateCount + ' 个节点，并将其绑定账号改绑到同 IP 的保留节点。' + summary, (confirmButton) => mutate(confirmButton, () => api('/nodes/deduplicate-exit-ips', {method:'POST', body:{confirm:true}}), '已剔除 ' + duplicateCount + ' 个重复出口节点'));
+      } catch (error) { toast(error.message, 'error'); }
+      finally { busy(button, false); }
     }
 
     async function showAccounts(node, button) {
@@ -615,6 +631,7 @@
       } catch (error) { toast(error.message, 'error'); }
       finally { busy(button, false); }
     });
+    $('deduplicate-exit-ips').addEventListener('click', (event) => deduplicateExitIPs(event.currentTarget));
     $('edit-policy').addEventListener('click', openPolicy);
     $('select-all').addEventListener('change', (event) => {
       filteredNodes().forEach((node) => event.target.checked ? state.selected.add(node.id) : state.selected.delete(node.id)); renderNodes();
@@ -668,7 +685,7 @@
     $('policy-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       const button = $('save-policy');
-      const body = {mode:$('policy-mode').value,activeIntervalSeconds:Number($('policy-active').value),passivePollSeconds:Number($('policy-passive').value),softTPS:Number($('policy-soft').value),hardTPS:Number($('policy-hard').value),consecutiveSoft:Number($('policy-soft-count').value),consecutiveErrors:Number($('policy-error-count').value),quarantineSeconds:Number($('policy-quarantine').value),minHealthyNodes:Number($('policy-min-healthy').value)};
+      const body = {mode:$('policy-mode').value,activeIntervalSeconds:Number($('policy-active').value),passivePollSeconds:Number($('policy-passive').value),softTPS:Number($('policy-soft').value),hardTPS:Number($('policy-hard').value),consecutiveSoft:Number($('policy-soft-count').value),consecutiveErrors:Number($('policy-error-count').value),quarantineSeconds:Number($('policy-quarantine').value),minHealthyNodes:Number($('policy-min-healthy').value,http429AccountAction:$('policy-429-account-action').value};
       if (body.softTPS >= body.hardTPS) { toast('软阈值必须低于硬阈值', 'error'); return; }
       busy(button, true);
       try { await api('/quality-guard/config', {method:'PUT', body}); toast('守护策略已保存'); closeModal('policy-modal'); await load(true); }

@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -163,6 +165,38 @@ func setAuthProxyAndFlags(a authFile, proxyURL string, disabled bool, reason str
 	return saveAuthFile(a.Name, a.Raw)
 }
 
+// deleteAuthFile disables the credential through the host before deleting its
+// physical file. The native host ABI has no delete callback; this guarded path
+// is valid only for file-backed credentials, which is the CPA deployment model.
+func deleteAuthFile(a authFile, reason string) error {
+	name := strings.TrimSpace(a.Name)
+	path := filepath.Clean(strings.TrimSpace(a.Path))
+	if name == "" || filepath.Base(name) != name || !strings.HasSuffix(strings.ToLower(name), ".json") {
+		return fmt.Errorf("账号文件名无效")
+	}
+	if path == "." || filepath.Base(path) != name {
+		return fmt.Errorf("账号不是可安全删除的本地文件")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("读取账号文件失败: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("账号不是常规文件")
+	}
+	if err := setAuthProxyAndFlags(a, a.ProxyURL, true, reason); err != nil {
+		return fmt.Errorf("下线账号失败: %w", err)
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("删除账号文件失败: %w", err)
+	}
+	authProxyMu.Lock()
+	authProxyCache = nil
+	authProxyAt = time.Time{}
+	authProxyMu.Unlock()
+	return nil
+}
+
 func rebalanceAuthsToNodes(store *stateStore) (map[string]int, error) {
 	auths, err := listAuthFiles()
 	if err != nil {
@@ -295,12 +329,9 @@ func pickAuthForNode(node *nodeRecord) (authFile, error) {
 	return list[0], nil
 }
 
-// listAuthsForNode returns up to limit enabled xAI auths bound to the node proxy,
-// preferring non-expired tokens. Falls back to any enabled xAI auth if none bound.
+// listAuthsForNode returns enabled xAI auths bound to the node proxy, preferring
+// non-expired tokens. A positive limit caps the result; zero returns all candidates.
 func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
-	if limit <= 0 {
-		limit = 5
-	}
 	auths, err := listAuthFiles()
 	if err != nil {
 		return nil, err
@@ -334,16 +365,102 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 	if len(out) == 0 {
 		out = append(out, expired...)
 	}
-	if len(out) < limit {
+	if limit <= 0 || len(out) < limit {
 		out = append(out, fallback...)
 	}
-	if len(out) > limit {
+	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("没有可用的 CPA xAI 账号")
 	}
 	return out, nil
+}
+
+func listProbeAuthsForNode(store *stateStore, node *nodeRecord, limit int) ([]authFile, bool, error) {
+	auths, err := listAuthsForNode(node, 0)
+	if err != nil {
+		return nil, false, err
+	}
+	if limit <= 0 {
+		limit = 8
+	}
+	available := make([]authFile, 0, limit)
+	cooling := false
+	now := time.Now()
+	for _, auth := range auths {
+		if store.isAccountCooling(auth, now) {
+			cooling = true
+			continue
+		}
+		available = append(available, auth)
+		if len(available) == limit {
+			break
+		}
+	}
+	return available, cooling, nil
+}
+
+func rebindAuthsToNode(auths []authFile, sourceProxy string, destination *nodeRecord) (int, error) {
+	if destination == nil || destination.ProxyURL == "" {
+		return 0, fmt.Errorf("保留节点缺少代理")
+	}
+	moved := 0
+	for _, auth := range auths {
+		if auth.ProxyURL != sourceProxy || sourceProxy == destination.ProxyURL {
+			continue
+		}
+		reason, _ := auth.Raw["disabled_reason"].(string)
+		if err := setAuthProxyAndFlags(auth, destination.ProxyURL, auth.Disabled, reason); err != nil {
+			return moved, fmt.Errorf("改绑账号 %s 失败: %w", auth.Name, err)
+		}
+		moved++
+	}
+	return moved, nil
+}
+
+func deduplicateExitIPNodes(store *stateStore) ([]exitIPDedupGroup, int, error) {
+	groups := planExitIPDedup(store.listNodes())
+	if len(groups) == 0 {
+		return groups, 0, nil
+	}
+	auths, err := listAuthFiles()
+	if err != nil {
+		return nil, 0, err
+	}
+	deleteIDs := make([]string, 0)
+	moved := 0
+	for _, group := range groups {
+		keep, ok := store.getNode(group.KeepID)
+		if !ok {
+			return nil, moved, fmt.Errorf("保留节点 %s 不存在", group.KeepID)
+		}
+		for _, deleteID := range group.DeleteIDs {
+			duplicate, ok := store.getNode(deleteID)
+			if !ok {
+				continue
+			}
+			count, err := rebindAuthsToNode(auths, duplicate.ProxyURL, keep)
+			if err != nil {
+				return nil, moved, err
+			}
+			moved += count
+			deleteIDs = append(deleteIDs, deleteID)
+		}
+	}
+	if err := store.deleteNodes(deleteIDs); err != nil {
+		return nil, moved, err
+	}
+	refreshAssignedCounts(store)
+	for _, group := range groups {
+		store.appendEvent(guardEvent{
+			Event:    "exit_ip_deduplicated",
+			NodeID:   group.KeepID,
+			NodeName: "出口 " + group.ExitIP,
+			Reason:   fmt.Sprintf("保留节点 %s，剔除 %d 个重复节点", group.KeepID, len(group.DeleteIDs)),
+		})
+	}
+	return groups, moved, nil
 }
 
 // listBoundAuthSummaries returns lightweight account info for a node (no secrets).

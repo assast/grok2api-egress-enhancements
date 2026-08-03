@@ -75,7 +75,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.0.3"
+	pluginVersion       = "1.0.4"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -374,6 +374,12 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			if v, ok := raw["disable_auth_on_hard"].(bool); ok {
 				p.DisableAuthOnHard = v
 			}
+			if v, ok := raw["http_429_account_action"].(string); ok {
+				p.HTTP429AccountAction = v
+			}
+			if v, ok := raw["http429AccountAction"].(string); ok {
+				p.HTTP429AccountAction = v
+			}
 			if err := store.updatePolicy(p); err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("invalidPolicy", err.Error()))
 			}
@@ -471,6 +477,36 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 				return managementJSON(http.StatusBadRequest, errMsg("rebalanceFailed", err.Error()))
 			}
 			return managementJSON(http.StatusOK, map[string]any{"ok": true, "counts": counts})
+		}
+
+	case path == "/nodes/deduplicate-exit-ips":
+		if method == http.MethodPost {
+			var raw map[string]any
+			_ = json.Unmarshal(body, &raw)
+			groups := planExitIPDedup(store.listNodes())
+			duplicates := 0
+			for _, group := range groups {
+				duplicates += len(group.DeleteIDs)
+			}
+			confirm, _ := raw["confirm"].(bool)
+			if !confirm {
+				return managementJSON(http.StatusOK, map[string]any{
+					"ok":                    true,
+					"requires_confirmation": true,
+					"groups":                groups,
+					"duplicate_nodes":       duplicates,
+				})
+			}
+			groups, rebound, err := deduplicateExitIPNodes(store)
+			if err != nil {
+				return managementJSON(http.StatusBadRequest, errMsg("deduplicateFailed", err.Error()))
+			}
+			return managementJSON(http.StatusOK, map[string]any{
+				"ok":               true,
+				"groups":           groups,
+				"deleted":          duplicates,
+				"accounts_rebound": rebound,
+			})
 		}
 
 	case len(parts) == 2 && parts[0] == "nodes" && safeID(parts[1]):
