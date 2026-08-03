@@ -75,7 +75,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.0.4"
+	pluginVersion       = "1.0.5"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -371,14 +371,17 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			if v, ok := raw["model"].(string); ok && v != "" {
 				p.Model = v
 			}
-			if v, ok := raw["disable_auth_on_hard"].(bool); ok {
-				p.DisableAuthOnHard = v
-			}
 			if v, ok := raw["http_429_account_action"].(string); ok {
 				p.HTTP429AccountAction = v
 			}
 			if v, ok := raw["http429AccountAction"].(string); ok {
 				p.HTTP429AccountAction = v
+			}
+			if v, ok := raw["non_429_isolation_action"].(string); ok {
+				p.Non429IsolationAction = v
+			}
+			if v, ok := raw["non429IsolationAction"].(string); ok {
+				p.Non429IsolationAction = v
 			}
 			if err := store.updatePolicy(p); err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("invalidPolicy", err.Error()))

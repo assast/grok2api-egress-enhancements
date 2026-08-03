@@ -14,3 +14,6 @@ cpa-plugin/**/auths/
 cpa-plugin/**/__pycache__/
 cpa-plugin/**/*.pyc
 .idea
+.claude
+.codex
+openspec

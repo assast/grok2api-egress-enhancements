@@ -274,6 +274,7 @@
           <div class="field"><label for="policy-soft-count">连续软异常次数</label><input id="policy-soft-count" type="number" min="1" max="20"></div>
           <div class="field"><label for="policy-error-count">连续错误次数</label><input id="policy-error-count" type="number" min="1" max="20"></div>
           <div class="field full"><label for="policy-429-account-action">上游 HTTP 429 账号处理</label><select id="policy-429-account-action"><option value="cooldown_24h">账号冷却 24 小时（默认；不计节点错误、不隔离节点）</option><option value="delete_account">直接删除命中账号</option></select><small>冷却策略只跳过质量探测，不改变 CPA 正常流量调度。</small></div>
+          <div class="field full"><label for="policy-non429-isolation-action">非 429 隔离后处理</label><select id="policy-non429-isolation-action"><option value="isolate_only">只隔离节点（默认；账号迁走或禁用）</option><option value="isolate_and_delete">隔离节点 + 删除命中账号</option><option value="delete_account_only">只删除命中账号（不隔离节点）</option></select><small>仅对本次探测/被动命中的账号生效；与 429 策略独立。</small></div>
           <div class="field full"><label for="policy-min-healthy">最低健康节点数</label><input id="policy-min-healthy" type="number" min="1" max="1000"></div>
         </div>
         <div class="modal-actions"><button class="button" type="button" data-close="policy-modal">取消</button><button id="save-policy" class="button primary" type="submit">保存策略</button></div>
@@ -308,6 +309,7 @@
     const number = (value) => new Intl.NumberFormat('zh-CN').format(Number(value || 0));
     const modeName = (mode) => ({active:'主动', passive:'被动', hybrid:'混合'})[mode] || '-';
     const http429AccountActionName = (action) => ({delete_account:'直接删除账号', cooldown_24h:'冷却 24 小时'})[action] || '冷却 24 小时';
+    const non429IsolationActionName = (action) => ({isolate_only:'只隔离节点', isolate_and_delete:'隔离节点 + 删除命中账号', delete_account_only:'只删除命中账号'})[action] || '只隔离节点';
     const time = (value, epoch = false) => {
       if (!value) return '-';
       const date = epoch ? new Date(Number(value) * 1000) : new Date(value);
@@ -515,14 +517,17 @@
     function renderEvents() {
       const events = state.status?.recentEvents || [];
       if (!events.length) { $('events-list').innerHTML = '<div class="empty">暂无守护事件</div>'; return; }
-      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',node_rotated:'出口 IP 已轮换',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',account_429_deleted:'429 账号已删除',account_429_cooled:'429 账号已冷却',exit_ip_deduplicated:'出口 IP 已剔重'};
-      $('events-list').innerHTML = events.slice().reverse().map((event) => '<div class="event"><div><strong>' + esc(names[event.event] || event.event || '守护事件') + ' · ' + esc(event.node_name || ('节点 ' + event.node_id)) + '</strong><small>' + esc(event.reason || event.classification || '-') + (event.output_tps ? ' · ' + Number(event.output_tps).toFixed(1) + ' Token/s' : '') + '</small></div><time>' + relative(event.ts) + '</time></div>').join('');
+      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',node_rotated:'出口 IP 已轮换',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',account_429_deleted:'429 账号已删除',account_429_cooled:'429 账号已冷却',exit_ip_deduplicated:'出口 IP 已剔重',account_deleted_on_isolation:'隔离并删除账号',account_deleted_only:'仅删除账号',account_delete_skipped:'删号已跳过'};
+      $('events-list').innerHTML = events.slice().reverse().map((event) => {
+        const authLabel = ' · 账号 ' + (event.auth_id || '—');
+        return '<div class="event"><div><strong>' + esc(names[event.event] || event.event || '守护事件') + ' · ' + esc(event.node_name || (event.node_id ? ('节点 ' + event.node_id) : '—')) + esc(authLabel) + '</strong><small>' + esc(event.reason || event.classification || '-') + (event.output_tps ? ' · ' + Number(event.output_tps).toFixed(1) + ' Token/s' : '') + '</small></div><time>' + relative(event.ts) + '</time></div>';
+      }).join('');
     }
     function renderPolicy() {
       const cfg = state.status?.config;
       $('edit-policy').disabled = !cfg;
       if (!cfg) { $('policy-view').innerHTML = '<div class="empty">策略状态不可用</div>'; return; }
-      const values = [['模式',modeName(cfg.mode)],['主动间隔',cfg.active_interval_seconds + ' 秒'],['被动轮询',cfg.passive_poll_seconds + ' 秒'],['软 / 硬阈值',cfg.soft_tps + ' / ' + cfg.hard_tps],['连续异常',cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],['隔离复测',cfg.quarantine_seconds + ' 秒'],['429 账号处理',http429AccountActionName(cfg.http_429_account_action)],['最低健康节点',cfg.min_healthy_nodes],['模型',cfg.model]];
+      const values = [['模式',modeName(cfg.mode)],['主动间隔',cfg.active_interval_seconds + ' 秒'],['被动轮询',cfg.passive_poll_seconds + ' 秒'],['软 / 硬阈值',cfg.soft_tps + ' / ' + cfg.hard_tps],['连续异常',cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],['隔离复测',cfg.quarantine_seconds + ' 秒'],['429 账号处理',http429AccountActionName(cfg.http_429_account_action)],['非 429 隔离后处理',non429IsolationActionName(cfg.non_429_isolation_action)],['最低健康节点',cfg.min_healthy_nodes],['模型',cfg.model]];
       $('policy-view').innerHTML = values.map((value) => '<div><dt>' + value[0] + '</dt><dd>' + esc(value[1]) + '</dd></div>').join('');
     }
     function openModal(id) { $(id).hidden = false; document.body.style.overflow = 'hidden'; $(id).querySelector('input,select,button')?.focus(); }
@@ -549,6 +554,7 @@
       $('policy-quarantine').value = cfg.quarantine_seconds; $('policy-soft').value = cfg.soft_tps; $('policy-hard').value = cfg.hard_tps;
       $('policy-soft-count').value = cfg.consecutive_soft; $('policy-error-count').value = cfg.consecutive_errors; $('policy-min-healthy').value = cfg.min_healthy_nodes;
       $('policy-429-account-action').value = cfg.http_429_account_action || 'cooldown_24h';
+      $('policy-non429-isolation-action').value = cfg.non_429_isolation_action || 'isolate_only';
       openModal('policy-modal');
     }
     function confirmAction(title, message, action) {
@@ -685,7 +691,7 @@
     $('policy-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       const button = $('save-policy');
-      const body = {mode:$('policy-mode').value,activeIntervalSeconds:Number($('policy-active').value),passivePollSeconds:Number($('policy-passive').value),softTPS:Number($('policy-soft').value),hardTPS:Number($('policy-hard').value),consecutiveSoft:Number($('policy-soft-count').value),consecutiveErrors:Number($('policy-error-count').value),quarantineSeconds:Number($('policy-quarantine').value),minHealthyNodes:Number($('policy-min-healthy').value),http429AccountAction:$('policy-429-account-action').value};
+      const body = {mode:$('policy-mode').value,activeIntervalSeconds:Number($('policy-active').value),passivePollSeconds:Number($('policy-passive').value),softTPS:Number($('policy-soft').value),hardTPS:Number($('policy-hard').value),consecutiveSoft:Number($('policy-soft-count').value),consecutiveErrors:Number($('policy-error-count').value),quarantineSeconds:Number($('policy-quarantine').value),minHealthyNodes:Number($('policy-min-healthy').value),http429AccountAction:$('policy-429-account-action').value,non429IsolationAction:$('policy-non429-isolation-action').value};
       if (body.softTPS >= body.hardTPS) { toast('软阈值必须低于硬阈值', 'error'); return; }
       busy(button, true);
       try { await api('/quality-guard/config', {method:'PUT', body}); toast('守护策略已保存'); closeModal('policy-modal'); await load(true); }

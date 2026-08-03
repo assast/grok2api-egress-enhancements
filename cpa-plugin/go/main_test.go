@@ -49,6 +49,135 @@ func TestHTTP429AccountActionDefaultsToCooldown(t *testing.T) {
 	}
 }
 
+
+func TestNon429IsolationActionDefaultsAndValidation(t *testing.T) {
+	if got := defaultPolicy().Non429IsolationAction; got != non429IsolationIsolateOnly {
+		t.Fatalf("default non429 action = %q, want %q", got, non429IsolationIsolateOnly)
+	}
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	p := s.policy()
+	p.Non429IsolationAction = "not-a-real-action"
+	if err := s.updatePolicy(p); err == nil {
+		t.Fatal("invalid non429 action must be rejected")
+	}
+	p = s.policy()
+	p.Non429IsolationAction = non429IsolationDeleteOnly
+	if err := s.updatePolicy(p); err != nil {
+		t.Fatal(err)
+	}
+	if s.policy().Non429IsolationAction != non429IsolationDeleteOnly {
+		t.Fatalf("got %q", s.policy().Non429IsolationAction)
+	}
+}
+
+func TestNon429IsolationActionLegacyLoad(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	// Old state without non_429_isolation_action, with disable_auth_on_hard noise
+	raw := `{
+  "version": 1,
+  "policy": {
+    "mode": "hybrid",
+    "soft_tps": 500,
+    "hard_tps": 1000,
+    "disable_auth_on_hard": true,
+    "http_429_account_action": "cooldown_24h"
+  },
+  "nodes": {},
+  "next_id": 1
+}`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := newStateStore(path)
+	if got := s.policy().Non429IsolationAction; got != non429IsolationIsolateOnly {
+		t.Fatalf("legacy load Non429IsolationAction = %q, want isolate_only", got)
+	}
+}
+
+func TestDeleteAccountOnlyDoesNotQuarantine(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	p := s.policy()
+	p.Non429IsolationAction = non429IsolationDeleteOnly
+	p.MinHealthyNodes = 1
+	if err := s.updatePolicy(p); err != nil {
+		t.Fatal(err)
+	}
+	// two nodes so isolate path would also be allowed; we assert delete_only never isolates
+	n1, err := s.createNode("a", "http://127.0.0.1:1", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.createNode("b", "http://127.0.0.1:2", true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	res := qualityResult{
+		Classification: "hard",
+		TPS:            2000,
+		OutputTokens:   100,
+		DurationMs:     50,
+		HitAuth:        authFile{Name: "xai-hit.json"},
+		HasHit:         false, // no real file → skip delete, still must not quarantine
+	}
+	applyObservation(s, n1.ID, "active", res)
+	updated, ok := s.getNode(n1.ID)
+	if !ok || updated.DisabledByGuard {
+		t.Fatalf("delete_account_only must not quarantine node: %#v", updated)
+	}
+	evs := s.events()
+	foundSkip := false
+	for _, e := range evs {
+		if e.Event == "account_delete_skipped" {
+			foundSkip = true
+		}
+		if e.Event == "node_quarantined" {
+			t.Fatalf("unexpected quarantine event: %#v", e)
+		}
+	}
+	if !foundSkip {
+		t.Fatal("expected account_delete_skipped when no hit auth")
+	}
+}
+
+func TestIsolateOnlyQuarantinesOnHard(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	p := s.policy()
+	p.Non429IsolationAction = non429IsolationIsolateOnly
+	p.MinHealthyNodes = 1
+	if err := s.updatePolicy(p); err != nil {
+		t.Fatal(err)
+	}
+	n1, err := s.createNode("a", "http://127.0.0.1:1", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.createNode("b", "http://127.0.0.1:2", true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	res := qualityResult{
+		Classification: "hard",
+		TPS:            2000,
+		OutputTokens:   100,
+		DurationMs:     50,
+		HitAuth:        authFile{Name: "xai-hit.json"},
+		HasHit:         true,
+	}
+	applyObservation(s, n1.ID, "active", res)
+	updated, ok := s.getNode(n1.ID)
+	if !ok || !updated.DisabledByGuard {
+		t.Fatalf("isolate_only must quarantine on hard: %#v", updated)
+	}
+	found := false
+	for _, e := range s.events() {
+		if e.Event == "node_quarantined" && e.AuthID == "xai-hit.json" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("quarantine event must include hit auth, events=%#v", s.events())
+	}
+}
+
 func TestExitIPDedupPlanKeepsSmallestNodeID(t *testing.T) {
 	nodes := []*nodeRecord{
 		{ID: "12", Name: "later", ExitIP: "203.0.113.9"},
@@ -86,7 +215,7 @@ func TestAccountLimitedResultDoesNotAffectNodeQuality(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	applyObservation(s, node.ID, "active", qualityResult{Classification: "account_limited", Error: "账号已冷却"})
+	applyObservation(s, node.ID, "active", qualityResult{Classification: "account_limited", Error: "账号已冷却", HitAuth: authFile{Name: "xai-limited.json"}, HasHit: true})
 	updated, ok := s.getNode(node.ID)
 	if !ok || updated.ErrorStrikes != 0 || updated.DisabledByGuard {
 		t.Fatalf("429 account handling changed node state: %#v", updated)
@@ -168,7 +297,7 @@ func TestCollectProxyURLs(t *testing.T) {
 
 func TestRenderStatusPage(t *testing.T) {
 	page := strings.Replace(pageTemplate, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
-	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "剔重出口 IP", "policy-429-account-action", "X-Grok2API-Egress-UI", "一行一个", "proxyURLs"} {
+	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "剔重出口 IP", "policy-429-account-action", "policy-non429-isolation-action", "non429IsolationAction", "X-Grok2API-Egress-UI", "一行一个", "proxyURLs"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("missing %q", want)
 		}
@@ -178,6 +307,9 @@ func TestRenderStatusPage(t *testing.T) {
 	}
 	if !strings.Contains(page, "minHealthyNodes:Number($('policy-min-healthy').value),http429AccountAction") {
 		t.Fatal("policy save script must close the min healthy node Number call before the 429 action")
+	}
+	if !strings.Contains(page, "non429IsolationAction:$('policy-non429-isolation-action').value") {
+		t.Fatal("policy save script must include non429IsolationAction")
 	}
 }
 

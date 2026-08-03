@@ -159,14 +159,27 @@ func probeConnectivity(proxyURL string) (exitIP string, latencyMs int64, err err
 }
 
 type qualityResult struct {
-	Classification string  `json:"classification"`
-	TPS            float64 `json:"tps"`
-	OutputTokens   int64   `json:"output_tokens"`
-	DurationMs     int64   `json:"duration_ms"`
-	FirstTokenMs   int64   `json:"first_token_ms"`
-	ExitIP         string  `json:"exit_ip,omitempty"`
-	Error          string  `json:"error,omitempty"`
-	Model          string  `json:"model,omitempty"`
+	Classification string   `json:"classification"`
+	TPS            float64  `json:"tps"`
+	OutputTokens   int64    `json:"output_tokens"`
+	DurationMs     int64    `json:"duration_ms"`
+	FirstTokenMs   int64    `json:"first_token_ms"`
+	ExitIP         string   `json:"exit_ip,omitempty"`
+	Error          string   `json:"error,omitempty"`
+	Model          string   `json:"model,omitempty"`
+	HitAuth        authFile `json:"-"`
+	HasHit         bool     `json:"-"`
+}
+
+func hitAuthID(res qualityResult) string {
+	// HasHit means a real auth file is available for delete; Name/Index may still
+	// hold a display label for events when file lookup failed.
+	return firstNonEmpty(res.HitAuth.Name, res.HitAuth.Index, res.HitAuth.Email)
+}
+
+func setHitAuth(res *qualityResult, auth authFile) {
+	res.HitAuth = auth
+	res.HasHit = true
 }
 
 func applyGrokClientHeaders(req *http.Request, auth authFile) {
@@ -354,6 +367,7 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 			res.DurationMs = time.Since(start).Milliseconds()
 			if isAccountRateLimited(resp.StatusCode) {
 				res.Classification = "account_limited"
+				setHitAuth(&res, auth)
 				res.Error = applyHTTP429AccountPolicy(store, node, auth, msg)
 				return res
 			}
@@ -363,6 +377,7 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 			}
 			res.Classification = "error"
 			res.Error = msg
+			setHitAuth(&res, auth)
 			return res
 		}
 
@@ -437,6 +452,7 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 			continue
 		}
 		res.Error = ""
+		setHitAuth(&res, auth)
 		return res
 	}
 
@@ -468,10 +484,10 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	pol := store.policy()
 	now := float64(time.Now().Unix())
 	var (
-		doRestore     bool
-		doQuarantine  bool
-		quarantineWhy string
-		nodeCopy      nodeRecord
+		doRestore bool
+		doAction  bool
+		actionWhy string
+		nodeCopy  nodeRecord
 	)
 	updated, err := store.updateNode(nodeID, func(n *nodeRecord) error {
 		n.LastClassification = res.Classification
@@ -503,20 +519,25 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 			}
 		case "soft":
 			n.SoftStrikes++
-			if n.SoftStrikes >= pol.ConsecutiveSoft && !n.DisabledByGuard {
-				doQuarantine = true
-				quarantineWhy = fmt.Sprintf("连续软阈值 Token/s=%.1f", res.TPS)
+			// delete_account_only 仍可在未隔离节点上触发；isolate_* 仅在未隔离时动作
+			if n.SoftStrikes >= pol.ConsecutiveSoft {
+				if pol.Non429IsolationAction == non429IsolationDeleteOnly || !n.DisabledByGuard {
+					doAction = true
+					actionWhy = fmt.Sprintf("连续软阈值 Token/s=%.1f", res.TPS)
+				}
 			}
 		case "hard":
-			if !n.DisabledByGuard {
-				doQuarantine = true
-				quarantineWhy = fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
+			if pol.Non429IsolationAction == non429IsolationDeleteOnly || !n.DisabledByGuard {
+				doAction = true
+				actionWhy = fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
 			}
 		case "error":
 			n.ErrorStrikes++
-			if n.ErrorStrikes >= pol.ConsecutiveErrors && !n.DisabledByGuard {
-				doQuarantine = true
-				quarantineWhy = "连续探测错误: " + res.Error
+			if n.ErrorStrikes >= pol.ConsecutiveErrors {
+				if pol.Non429IsolationAction == non429IsolationDeleteOnly || !n.DisabledByGuard {
+					doAction = true
+					actionWhy = "连续探测错误: " + res.Error
+				}
 			}
 		}
 		nodeCopy = *n
@@ -528,16 +549,126 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	}
 	if doRestore {
 		store.bumpAction("restored")
-		store.appendEvent(guardEvent{Event: "node_restored", NodeID: nodeCopy.ID, NodeName: nodeCopy.Name, Classification: "healthy", OutputTPS: res.TPS})
+		store.appendEvent(guardEvent{
+			Event:          "node_restored",
+			NodeID:         nodeCopy.ID,
+			NodeName:       nodeCopy.Name,
+			AuthID:         hitAuthID(res),
+			Classification: "healthy",
+			OutputTPS:      res.TPS,
+		})
 		go func(nn nodeRecord) { _ = enableAuthsOnNode(&nn) }(nodeCopy)
 	}
-	if doQuarantine {
-		quarantineNode(store, nodeCopy.ID, quarantineWhy, res.TPS, res.Classification)
+	if doAction {
+		applyNon429IsolationAction(store, nodeCopy.ID, actionWhy, res)
 	}
 	store.bumpStat(source, res.Classification, res.OutputTokens)
 }
 
-func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class string) {
+func applyNon429IsolationAction(store *stateStore, nodeID, reason string, res qualityResult) {
+	pol := store.policy()
+	action := normalizeNon429IsolationAction(pol.Non429IsolationAction)
+	if action == "" {
+		action = non429IsolationIsolateOnly
+	}
+	authLabel := hitAuthID(res)
+
+	switch action {
+	case non429IsolationDeleteOnly:
+		deleteHitAuthOnly(store, nodeID, reason, res)
+		return
+	case non429IsolationIsolateDelete:
+		quarantineNode(store, nodeID, reason, res.TPS, res.Classification, authLabel)
+		deleteHitAuthOnIsolation(store, nodeID, reason, res)
+		return
+	default: // isolate_only
+		quarantineNode(store, nodeID, reason, res.TPS, res.Classification, authLabel)
+	}
+}
+
+func deleteHitAuthOnly(store *stateStore, nodeID, reason string, res qualityResult) {
+	n, _ := store.getNode(nodeID)
+	nodeName := ""
+	if n != nil {
+		nodeName = n.Name
+	}
+	if !res.HasHit {
+		store.appendEvent(guardEvent{
+			Event:          "account_delete_skipped",
+			NodeID:         nodeID,
+			NodeName:       nodeName,
+			Reason:         "只删号策略但无命中账号: " + reason,
+			Classification: res.Classification,
+			OutputTPS:      res.TPS,
+		})
+		return
+	}
+	delReason := "egress-guard 非429只删号: " + reason
+	if err := deleteAuthFile(res.HitAuth, delReason); err != nil {
+		store.appendEvent(guardEvent{
+			Event:          "account_delete_skipped",
+			NodeID:         nodeID,
+			NodeName:       nodeName,
+			AuthID:         hitAuthID(res),
+			Reason:         "删除命中账号失败: " + err.Error(),
+			Classification: res.Classification,
+			OutputTPS:      res.TPS,
+		})
+		return
+	}
+	store.appendEvent(guardEvent{
+		Event:          "account_deleted_only",
+		NodeID:         nodeID,
+		NodeName:       nodeName,
+		AuthID:         hitAuthID(res),
+		Reason:         "非429只删号: " + reason,
+		Classification: res.Classification,
+		OutputTPS:      res.TPS,
+	})
+}
+
+func deleteHitAuthOnIsolation(store *stateStore, nodeID, reason string, res qualityResult) {
+	n, _ := store.getNode(nodeID)
+	nodeName := ""
+	if n != nil {
+		nodeName = n.Name
+	}
+	if !res.HasHit {
+		store.appendEvent(guardEvent{
+			Event:          "account_delete_skipped",
+			NodeID:         nodeID,
+			NodeName:       nodeName,
+			Reason:         "隔离+删号但无命中账号: " + reason,
+			Classification: res.Classification,
+			OutputTPS:      res.TPS,
+		})
+		return
+	}
+	delReason := "egress-guard 非429隔离删号: " + reason
+	if err := deleteAuthFile(res.HitAuth, delReason); err != nil {
+		store.appendEvent(guardEvent{
+			Event:          "account_delete_skipped",
+			NodeID:         nodeID,
+			NodeName:       nodeName,
+			AuthID:         hitAuthID(res),
+			Reason:         "隔离后删除命中账号失败: " + err.Error(),
+			Classification: res.Classification,
+			OutputTPS:      res.TPS,
+		})
+		return
+	}
+	store.appendEvent(guardEvent{
+		Event:          "account_deleted_on_isolation",
+		NodeID:         nodeID,
+		NodeName:       nodeName,
+		AuthID:         hitAuthID(res),
+		Reason:         "非429隔离+删号: " + reason,
+		Classification: res.Classification,
+		OutputTPS:      res.TPS,
+	})
+}
+
+func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class, authID string) {
 	pol := store.policy()
 	enabledHealthy := 0
 	var target *nodeRecord
@@ -555,7 +686,14 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 	}
 	if enabledHealthy < pol.MinHealthyNodes {
 		store.bumpAction("suppressed")
-		store.appendEvent(guardEvent{Event: "quarantine_suppressed", NodeID: target.ID, NodeName: target.Name, Reason: "低于最低健康节点数", OutputTPS: tps})
+		store.appendEvent(guardEvent{
+			Event:     "quarantine_suppressed",
+			NodeID:    target.ID,
+			NodeName:  target.Name,
+			AuthID:    authID,
+			Reason:    "低于最低健康节点数",
+			OutputTPS: tps,
+		})
 		_, _ = store.updateNode(nodeID, func(n *nodeRecord) error {
 			n.LastReason = "隔离已抑制: " + reason
 			return nil
@@ -572,10 +710,19 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 		return
 	}
 	store.bumpAction("quarantined")
-	store.appendEvent(guardEvent{Event: "node_quarantined", NodeID: updated.ID, NodeName: updated.Name, Reason: reason, Classification: class, OutputTPS: tps})
-	// Move accounts off the bad channel onto healthy ones (or disable in place).
+	store.appendEvent(guardEvent{
+		Event:          "node_quarantined",
+		NodeID:         updated.ID,
+		NodeName:       updated.Name,
+		AuthID:         authID,
+		Reason:         reason,
+		Classification: class,
+		OutputTPS:      tps,
+	})
+	// Move accounts off the bad channel; migrate failure disables in place
+	// (absorbs former DisableAuthOnHard=true default).
 	go func(nn nodeRecord, why string) {
-		if err := migrateAuthsOffNode(store, &nn); err != nil && pol.DisableAuthOnHard {
+		if err := migrateAuthsOffNode(store, &nn); err != nil {
 			_ = disableAuthsOnNode(store, &nn, "egress-guard 降智隔离: "+why)
 		}
 	}(*updated, reason)
@@ -624,6 +771,7 @@ func runNodeQuality(store *stateStore, id string) (map[string]any, error) {
 		Event:          "quality_probe_completed",
 		NodeID:         id,
 		NodeName:       n.Name,
+		AuthID:         hitAuthID(res),
 		Classification: res.Classification,
 		OutputTPS:      res.TPS,
 		Reason:         res.Error,
@@ -724,12 +872,27 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 		DurationMs:     durMs,
 		FirstTokenMs:   ttftMs,
 	}
+	for _, key := range []string{authID, authIndex, filepath.Base(authID), strings.TrimSuffix(filepath.Base(authID), ".json")} {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if a, err := getAuthFile(key); err == nil {
+			setHitAuth(&res, a)
+			break
+		}
+	}
+	if !res.HasHit {
+		if label := firstNonEmpty(authID, authIndex); label != "" {
+			res.HitAuth = authFile{Name: label, Index: authIndex}
+		}
+	}
 	if nodeID == "" {
 		store.bumpStat("passive", class, outTokens)
 		if class == "hard" || class == "soft" {
 			store.appendEvent(guardEvent{
 				Event:          "unmapped_" + class,
-				AuthID:         firstNonEmpty(authID, authIndex),
+				AuthID:         firstNonEmpty(hitAuthID(res), authID, authIndex),
 				Classification: class,
 				OutputTPS:      tps,
 				Reason:         fmt.Sprintf("usage 未映射到出口节点 auth=%s idx=%s tokens=%d dur=%dms ttft=%dms", authID, authIndex, outTokens, durMs, ttftMs),
@@ -740,10 +903,10 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 					store.appendEvent(guardEvent{
 						Event:          "hard_fallback_map",
 						NodeID:         fallback,
-						AuthID:         authID,
+						AuthID:         firstNonEmpty(hitAuthID(res), authID, authIndex),
 						Classification: "hard",
 						OutputTPS:      tps,
-						Reason:         "未映射账号的硬异常，回退记到负载最高通道并隔离",
+						Reason:         "未映射账号的硬异常，回退记到负载最高通道并按非429策略处理",
 					})
 					applyObservation(store, fallback, "passive", res)
 				}
@@ -751,7 +914,7 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 		}
 		return
 	}
-	// Always apply observation for mapped nodes (quarantine on hard/soft).
+	// Always apply observation for mapped nodes (strategy on hard/soft/error).
 	applyObservation(store, nodeID, "passive", res)
 }
 

@@ -15,22 +15,26 @@ import (
 const (
 	http429AccountActionDelete     = "delete_account"
 	http429AccountActionCooldown24 = "cooldown_24h"
+
+	non429IsolationIsolateOnly   = "isolate_only"
+	non429IsolationIsolateDelete = "isolate_and_delete"
+	non429IsolationDeleteOnly    = "delete_account_only"
 )
 
 type policyConfig struct {
-	Mode                 string  `json:"mode"`
-	ActiveIntervalSec    int     `json:"active_interval_seconds"`
-	PassivePollSec       int     `json:"passive_poll_seconds"`
-	QuarantineSec        int     `json:"quarantine_seconds"`
-	SoftTPS              float64 `json:"soft_tps"`
-	HardTPS              float64 `json:"hard_tps"`
-	ConsecutiveSoft      int     `json:"consecutive_soft"`
-	ConsecutiveErrors    int     `json:"consecutive_errors"`
-	MinHealthyNodes      int     `json:"min_healthy_nodes"`
-	Model                string  `json:"model"`
-	DisableAuthOnHard    bool    `json:"disable_auth_on_hard"`
-	MaxOutputTokensProbe int     `json:"max_output_tokens"`
-	HTTP429AccountAction string  `json:"http_429_account_action"`
+	Mode                   string  `json:"mode"`
+	ActiveIntervalSec      int     `json:"active_interval_seconds"`
+	PassivePollSec         int     `json:"passive_poll_seconds"`
+	QuarantineSec          int     `json:"quarantine_seconds"`
+	SoftTPS                float64 `json:"soft_tps"`
+	HardTPS                float64 `json:"hard_tps"`
+	ConsecutiveSoft        int     `json:"consecutive_soft"`
+	ConsecutiveErrors      int     `json:"consecutive_errors"`
+	MinHealthyNodes        int     `json:"min_healthy_nodes"`
+	Model                  string  `json:"model"`
+	MaxOutputTokensProbe   int     `json:"max_output_tokens"`
+	HTTP429AccountAction   string  `json:"http_429_account_action"`
+	Non429IsolationAction  string  `json:"non_429_isolation_action"`
 }
 
 type accountCooldown struct {
@@ -118,19 +122,28 @@ type stateStore struct {
 
 func defaultPolicy() policyConfig {
 	return policyConfig{
-		Mode:                 "hybrid",
-		ActiveIntervalSec:    1800,
-		PassivePollSec:       5,
-		QuarantineSec:        120,
-		SoftTPS:              500,
-		HardTPS:              1000,
-		ConsecutiveSoft:      2,
-		ConsecutiveErrors:    2,
-		MinHealthyNodes:      1,
-		Model:                "grok-4.5",
-		DisableAuthOnHard:    true,
-		MaxOutputTokensProbe: 384,
-		HTTP429AccountAction: http429AccountActionCooldown24,
+		Mode:                  "hybrid",
+		ActiveIntervalSec:     1800,
+		PassivePollSec:        5,
+		QuarantineSec:         120,
+		SoftTPS:               500,
+		HardTPS:               1000,
+		ConsecutiveSoft:       2,
+		ConsecutiveErrors:     2,
+		MinHealthyNodes:       1,
+		Model:                 "grok-4.5",
+		MaxOutputTokensProbe:  384,
+		HTTP429AccountAction:  http429AccountActionCooldown24,
+		Non429IsolationAction: non429IsolationIsolateOnly,
+	}
+}
+
+func normalizeNon429IsolationAction(v string) string {
+	switch strings.TrimSpace(v) {
+	case non429IsolationIsolateOnly, non429IsolationIsolateDelete, non429IsolationDeleteOnly:
+		return strings.TrimSpace(v)
+	default:
+		return ""
 	}
 }
 
@@ -177,6 +190,12 @@ func (s *stateStore) load() error {
 	}
 	if data.Policy.HTTP429AccountAction == "" {
 		data.Policy.HTTP429AccountAction = http429AccountActionDelete
+	}
+	if data.Policy.Non429IsolationAction == "" || normalizeNon429IsolationAction(data.Policy.Non429IsolationAction) == "" {
+		// 旧版 disable_auth_on_hard 不再读取；缺省等价 isolate_only
+		data.Policy.Non429IsolationAction = non429IsolationIsolateOnly
+	} else {
+		data.Policy.Non429IsolationAction = normalizeNon429IsolationAction(data.Policy.Non429IsolationAction)
 	}
 	// hydrate private proxy field
 	for _, n := range data.Nodes {
@@ -259,6 +278,13 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 	if p.HTTP429AccountAction != http429AccountActionDelete && p.HTTP429AccountAction != http429AccountActionCooldown24 {
 		return fmt.Errorf("429 账号处理策略无效")
 	}
+	if p.Non429IsolationAction == "" {
+		p.Non429IsolationAction = non429IsolationIsolateOnly
+	}
+	if normalizeNon429IsolationAction(p.Non429IsolationAction) == "" {
+		return fmt.Errorf("非 429 隔离后处理策略无效")
+	}
+	p.Non429IsolationAction = normalizeNon429IsolationAction(p.Non429IsolationAction)
 	s.data.Policy = p
 	return s.persistLocked()
 }
