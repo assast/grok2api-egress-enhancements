@@ -176,6 +176,9 @@ func TestRenderStatusPage(t *testing.T) {
 	if strings.Contains(page, "/*__HALLMARK_TOKENS__*/") {
 		t.Fatal("tokens not replaced in test helper path only")
 	}
+	if !strings.Contains(page, "minHealthyNodes:Number($('policy-min-healthy').value),http429AccountAction") {
+		t.Fatal("policy save script must close the min healthy node Number call before the 429 action")
+	}
 }
 
 func TestUIProxyRejectsMissingHeader(t *testing.T) {
