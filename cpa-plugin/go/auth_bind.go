@@ -360,12 +360,12 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 	}
 	out := make([]authFile, 0, limit)
 	out = append(out, primary...)
-	// If node has no fresh bound auth, still try expired bound ones before foreign auths
+	// Prefer proxy-bound accounts. Only if none are bound, fall back to foreign auths
 	// so quality probe still pins to the channel when possible.
 	if len(out) == 0 {
 		out = append(out, expired...)
 	}
-	if limit <= 0 || len(out) < limit {
+	if len(out) == 0 {
 		out = append(out, fallback...)
 	}
 	if limit > 0 && len(out) > limit {

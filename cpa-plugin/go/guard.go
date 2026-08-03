@@ -887,6 +887,25 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 			res.HitAuth = authFile{Name: label, Index: authIndex}
 		}
 	}
+	// usage 未映射到出口节点：若账号已绑定 proxy_url，则自动补建节点并完成映射。
+	if nodeID == "" && res.HasHit {
+		if id, created, err := ensureNodeForAuthProxy(store, res.HitAuth); err == nil && id != "" {
+			nodeID = id
+			if created {
+				nodeName := ""
+				if n, ok := store.getNode(id); ok && n != nil {
+					nodeName = n.Name
+				}
+				store.appendEvent(guardEvent{
+					Event:    "node_auto_created",
+					NodeID:   id,
+					NodeName: nodeName,
+					AuthID:   firstNonEmpty(hitAuthID(res), authID, authIndex),
+					Reason:   fmt.Sprintf("usage 未映射，已按账号 proxy_url 自动添加节点: %s", strings.TrimSpace(res.HitAuth.ProxyURL)),
+				})
+			}
+		}
+	}
 	if nodeID == "" {
 		store.bumpStat("passive", class, outTokens)
 		if class == "hard" || class == "soft" {
@@ -916,6 +935,72 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 	}
 	// Always apply observation for mapped nodes (strategy on hard/soft/error).
 	applyObservation(store, nodeID, "passive", res)
+}
+
+
+// ensureNodeForAuthProxy maps an auth's proxy_url to an existing node, or creates one.
+// created=true only when a new node was inserted. Empty proxy returns ("", false, nil).
+func ensureNodeForAuthProxy(store *stateStore, auth authFile) (nodeID string, created bool, err error) {
+	proxy := strings.TrimSpace(auth.ProxyURL)
+	if proxy == "" {
+		return "", false, nil
+	}
+	if existing, ok := store.getNodeByProxy(proxy); ok {
+		return existing.ID, false, nil
+	}
+	name := autoNodeNameFromAuth(auth, proxy)
+	createdNode, err := store.createNode(name, proxy, true, false, 0)
+	if err != nil {
+		return "", false, err
+	}
+	// 刷新 auth→proxy 缓存，后续 usage 可直接命中。
+	authProxyMu.Lock()
+	authProxyCache = nil
+	authProxyAt = time.Time{}
+	authProxyMu.Unlock()
+	refreshAssignedCounts(store)
+
+	// 补建节点后自动绑定该账号到新节点
+	if created {
+		if err := setAuthProxyAndFlags(auth, proxy, false, "usage 未映射后自动补建节点并绑定"); err != nil {
+			// 绑定失败只记录，不影响节点创建
+			store.appendEvent(guardEvent{
+				Event:  "auth_bind_failed_after_auto_create",
+				AuthID: auth.Name,
+				NodeID: createdNode.ID,
+				Reason: "补建节点后绑定账号失败: " + err.Error(),
+			})
+		}
+	}
+
+	return createdNode.ID, true, nil
+}
+
+func autoNodeNameFromAuth(a authFile, proxyURL string) string {
+	if host := proxyHostLabel(proxyURL); host != "" {
+		return "auto-" + host
+	}
+	if a.Email != "" {
+		return "auto-" + a.Email
+	}
+	base := strings.TrimSuffix(filepath.Base(firstNonEmpty(a.Name, a.Index)), ".json")
+	base = strings.TrimPrefix(base, "xai-")
+	if base != "" {
+		return "auto-" + base
+	}
+	return "auto-channel"
+}
+
+func proxyHostLabel(proxyURL string) string {
+	u, err := url.Parse(strings.TrimSpace(proxyURL))
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	host := u.Hostname()
+	if u.Port() != "" {
+		return host + "-" + u.Port()
+	}
+	return host
 }
 
 func firstNonEmpty(vals ...string) string {

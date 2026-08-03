@@ -356,6 +356,22 @@ func (s *stateStore) getNode(id string) (*nodeRecord, bool) {
 	return &cp, true
 }
 
+func (s *stateStore) getNodeByProxy(proxyURL string) (*nodeRecord, bool) {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, n := range s.data.Nodes {
+		if n != nil && n.ProxyURL == proxyURL {
+			cp := *n
+			return &cp, true
+		}
+	}
+	return nil, false
+}
+
 func (s *stateStore) createNode(name, proxyURL string, enabled, pool bool, capacity int) (*nodeRecord, error) {
 	items, err := s.createNodes(name, []string{proxyURL}, enabled, pool, capacity)
 	if err != nil {

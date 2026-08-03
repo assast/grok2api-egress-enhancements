@@ -346,3 +346,76 @@ func TestDispatchNodesList(t *testing.T) {
 		t.Fatalf("body %s", resp.Body)
 	}
 }
+
+
+func TestProxyHostLabel(t *testing.T) {
+	cases := []struct {
+		proxy string
+		want  string
+	}{
+		{"http://proxy.example.com", "proxy.example.com"},
+		{"socks5h://user:pass@1.2.3.4:1080", "1.2.3.4-1080"},
+		{"http://proxy.example.com:8080", "proxy.example.com-8080"},
+		{"", ""},
+		{"not-a-url", ""},
+	}
+	for _, c := range cases {
+		if got := proxyHostLabel(c.proxy); got != c.want {
+			t.Fatalf("proxyHostLabel(%q)=%q want %q", c.proxy, got, c.want)
+		}
+	}
+}
+
+func TestAutoNodeNameFromAuth(t *testing.T) {
+	if got := autoNodeNameFromAuth(authFile{}, "socks5h://u@10.0.0.1:1080"); got != "auto-10.0.0.1-1080" {
+		t.Fatalf("got %q", got)
+	}
+	if got := autoNodeNameFromAuth(authFile{Email: "a@b.com", Name: "xai-a@b.com.json"}, "bad"); got != "auto-a@b.com" {
+		t.Fatalf("email fallback got %q", got)
+	}
+	if got := autoNodeNameFromAuth(authFile{Name: "xai-user.json"}, ""); got != "auto-user" {
+		t.Fatalf("name fallback got %q", got)
+	}
+}
+
+func TestGetNodeByProxy(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	n, err := s.createNode("ch", "http://127.0.0.1:9001", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s.getNodeByProxy("http://127.0.0.1:9001")
+	if !ok || got.ID != n.ID {
+		t.Fatalf("getNodeByProxy ok=%v id=%v want %s", ok, got, n.ID)
+	}
+	if _, ok := s.getNodeByProxy("http://missing"); ok {
+		t.Fatal("missing proxy should not match")
+	}
+	if _, ok := s.getNodeByProxy(""); ok {
+		t.Fatal("empty proxy should not match")
+	}
+}
+
+func TestEnsureNodeFromAuthProxyCreatesOnce(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	auth := authFile{
+		Name:     "xai-alessandrolomison9918005-leave@hotmail.com.json",
+		Email:    "alessandrolomison9918005-leave@hotmail.com",
+		ProxyURL: "socks5h://user:pass@203.0.113.9:1080",
+	}
+	id1, created1, err := ensureNodeForAuthProxy(s, auth)
+	if err != nil || !created1 || id1 == "" {
+		t.Fatalf("first ensure err=%v created=%v id=%q", err, created1, id1)
+	}
+	id2, created2, err := ensureNodeForAuthProxy(s, auth)
+	if err != nil || created2 || id2 != id1 {
+		t.Fatalf("second ensure err=%v created=%v id=%q want id=%q", err, created2, id2, id1)
+	}
+	n, ok := s.getNode(id1)
+	if !ok || n.ProxyURL != auth.ProxyURL {
+		t.Fatalf("node missing or proxy mismatch: %#v", n)
+	}
+	if !strings.HasPrefix(n.Name, "auto-") {
+		t.Fatalf("auto name = %q", n.Name)
+	}
+}
