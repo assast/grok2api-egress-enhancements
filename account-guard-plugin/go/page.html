@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" href="data:,">
+  <title>账号守护</title>
+  <style>
+/*__HALLMARK_TOKENS__*/
+    * { box-sizing: border-box; border-color: var(--border); }
+    html, body { margin: 0; min-width: 0; overflow-x: clip; background: var(--background); color: var(--foreground); }
+    body { font-family: var(--font-body); font-size: var(--text-md); line-height: 1.5; -webkit-font-smoothing: antialiased; }
+    button, input, select, textarea { font: inherit; }
+    button { white-space: nowrap; }
+    [hidden] { display: none !important; }
+    .shell { width: min(100%, 1440px); margin: 0 auto; padding: var(--space-md); }
+    .stack > * + * { margin-top: var(--space-md); }
+    .page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-sm); }
+    .page-head > div:first-child { min-width: 0; }
+    .page-head h1 { min-width: 0; margin: 0; font-family: var(--font-display); font-size: var(--text-xl); font-weight: 650; line-height: 1.2; overflow-wrap: anywhere; }
+    .page-head p { margin: var(--space-3xs) 0 0; color: var(--muted-foreground); font-size: var(--text-xs); }
+    .head-actions, .toolbar, .row-actions, .modal-actions { display: flex; align-items: center; gap: var(--space-2xs); }
+    .status-line { display: inline-flex; align-items: center; gap: var(--space-2xs); color: var(--muted-foreground); font-size: var(--text-xs); }
+    .status-dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--muted-foreground); }
+    .status-dot.good { background: var(--success); }
+    .status-dot.bad { background: var(--destructive); }
+    .button { min-height: 2.25rem; display: inline-flex; align-items: center; justify-content: center; gap: var(--space-3xs); border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-sm); padding: 0 var(--space-xs); background: var(--secondary); color: var(--secondary-foreground); font-size: var(--text-xs); font-weight: 600; line-height: 1; cursor: pointer; transition: background var(--dur-short) var(--ease-out), color var(--dur-short) var(--ease-out), opacity var(--dur-short) var(--ease-out), transform var(--dur-fast) var(--ease-out); }
+    .button:hover { background: var(--accent); color: var(--accent-foreground); }
+    .button:active { transform: translateY(1px); }
+    .button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+    .button:disabled { opacity: 0.48; cursor: not-allowed; transform: none; }
+    .button.primary { background: var(--primary); color: var(--primary-foreground); border-color: var(--primary); }
+    .button.primary:hover { opacity: 0.9; }
+    .button.ghost { background: transparent; }
+    .button.icon { width: 2.25rem; padding: 0; font-size: var(--text-lg); font-weight: 400; }
+    .button.busy::before { content: ""; width: 0.75rem; height: 0.75rem; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin 0.7s linear infinite; }
+    .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); overflow: hidden; border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-md); background: var(--card); }
+    .metric { min-width: 0; min-height: 5.25rem; padding: var(--space-sm); border-right: var(--rule-hairline) solid var(--border); }
+    .metric:last-child { border-right: 0; }
+    .metric-label { color: var(--muted-foreground); font-size: var(--text-xs); }
+    .metric-value { margin-top: var(--space-3xs); font-size: var(--text-lg); font-weight: 650; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    .metric-detail { margin-top: var(--space-3xs); color: var(--muted-foreground); font-size: var(--text-2xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .tone-good { color: var(--success); }
+    .tone-warn { color: var(--warning); }
+    .tone-bad { color: var(--destructive); }
+    .section { border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-md); background: var(--card); overflow: hidden; }
+    .section-head { min-width: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-sm); padding: var(--space-sm); border-bottom: var(--rule-hairline) solid var(--border); }
+    .section-head h2 { margin: 0; font-size: var(--text-md); font-weight: 650; }
+    .section-head p { margin: var(--space-3xs) 0 0; color: var(--muted-foreground); font-size: var(--text-xs); }
+    .toolbar { flex-wrap: wrap; justify-content: flex-end; }
+    .search { width: min(16rem, 100%); }
+    input, select, textarea { min-height: 2.25rem; width: 100%; border: var(--rule-hairline) solid var(--input); border-radius: var(--radius-sm); padding: 0 var(--space-xs); background: var(--background); color: var(--foreground); }
+    input:hover, select:hover, textarea:hover { border-color: var(--ring); }
+    input:user-invalid, select:user-invalid { border-color: var(--destructive); background: var(--danger-surface); }
+    input:disabled, select:disabled { opacity: 0.55; cursor: not-allowed; background: var(--muted); }
+    input::placeholder { color: var(--muted-foreground); }
+    input[type="checkbox"] { width: 1rem; min-height: 1rem; accent-color: var(--primary); }
+    .table-wrap { max-width: 100%; overflow: auto; }
+    table { width: 100%; min-width: 960px; border-collapse: collapse; }
+    th, td { padding: var(--space-xs); border-bottom: var(--rule-hairline) solid var(--border); text-align: left; vertical-align: middle; }
+    th { position: sticky; top: 0; z-index: 1; background: var(--card); color: var(--muted-foreground); font-size: var(--text-xs); font-weight: 550; white-space: nowrap; }
+    td { font-size: var(--text-xs); }
+    tbody tr:last-child td { border-bottom: 0; }
+    tbody tr:hover td { background: color-mix(in oklch, var(--secondary) 55%, transparent); }
+    .account-name { max-width: 20rem; font-weight: 620; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .subtext { margin-top: var(--space-3xs); color: var(--muted-foreground); font-size: var(--text-2xs); overflow-wrap: anywhere; max-width: 24rem; }
+    .numeric { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+    .badge { display: inline-flex; align-items: center; min-height: 1.35rem; border-radius: 999px; padding: 0 var(--space-2xs); font-size: var(--text-2xs); font-weight: 650; white-space: nowrap; }
+    .badge.good { color: var(--success); background: var(--success-surface); }
+    .badge.warn { color: var(--warning); background: var(--warning-surface); }
+    .badge.bad { color: var(--destructive); background: var(--danger-surface); }
+    .badge.muted { color: var(--muted-foreground); background: var(--secondary); }
+    .badge + .badge { margin-left: var(--space-3xs); }
+    .account-cards { display: none; gap: var(--space-sm); padding: var(--space-sm); }
+    .account-card { border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-md); padding: var(--space-sm); background: var(--background); display: grid; gap: var(--space-2xs); }
+    .account-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-sm); }
+    .account-card-meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-2xs); font-size: var(--text-2xs); color: var(--muted-foreground); }
+    .account-card-meta strong { display: block; color: var(--foreground); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
+    .empty, .loading, .error-state { padding: var(--space-xl) var(--space-sm); text-align: center; color: var(--muted-foreground); font-size: var(--text-xs); }
+    .error-state { color: var(--destructive); }
+    .stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .stat { min-width: 0; min-height: 5.5rem; padding: var(--space-sm); border-right: var(--rule-hairline) solid var(--border); border-bottom: var(--rule-hairline) solid var(--border); }
+    .stat:nth-child(3n) { border-right: 0; }
+    .stat:nth-last-child(-n+3) { border-bottom: 0; }
+    .stat strong { display: block; margin-top: var(--space-3xs); font-size: var(--text-lg); font-variant-numeric: tabular-nums; }
+    .stat small { display: block; margin-top: var(--space-3xs); color: var(--muted-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .lower-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(17rem, 2fr); gap: var(--space-md); }
+    .events { max-height: 24rem; overflow: auto; }
+    .event { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-sm); padding: var(--space-xs) var(--space-sm); border-bottom: var(--rule-hairline) solid var(--border); }
+    .event:last-child { border-bottom: 0; }
+    .event strong { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .event time, .event small { color: var(--muted-foreground); font-size: var(--text-2xs); }
+    .event small { display: block; overflow-wrap: anywhere; }
+    .policy { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-sm); padding: var(--space-sm); }
+    .policy dt { color: var(--muted-foreground); font-size: var(--text-2xs); }
+    .policy dd { margin: var(--space-3xs) 0 0; font-weight: 620; font-variant-numeric: tabular-nums; }
+    .modal-layer { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: var(--space-sm); background: var(--overlay); }
+    .modal { width: min(34rem, 100%); max-height: calc(100svh - 2rem); overflow: auto; border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-md); background: var(--popover); color: var(--popover-foreground); box-shadow: var(--shadow); }
+    .modal.wide { width: min(42rem, 100%); }
+    .modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-sm); padding: var(--space-sm); border-bottom: var(--rule-hairline) solid var(--border); }
+    .modal-head h3 { margin: 0; font-size: var(--text-lg); }
+    .modal-head p { margin: var(--space-3xs) 0 0; color: var(--muted-foreground); font-size: var(--text-xs); }
+    .modal-body { padding: var(--space-sm); }
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-sm); }
+    .field { min-width: 0; }
+    .field.full { grid-column: 1 / -1; }
+    .field label { display: block; margin-bottom: var(--space-3xs); font-size: var(--text-xs); font-weight: 600; }
+    .field small, .field .help { display: block; margin-top: var(--space-3xs); color: var(--muted-foreground); font-size: var(--text-2xs); }
+    .check-row { min-height: 2.75rem; display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm); padding: 0 var(--space-xs); border-radius: var(--radius-sm); background: var(--muted); }
+    .check-row label { margin: 0; }
+    .form-error { margin: 0 var(--space-sm); padding: var(--space-2xs) var(--space-xs); border: var(--rule-hairline) solid var(--destructive); border-radius: var(--radius-sm); background: var(--danger-surface); color: var(--destructive); font-size: var(--text-xs); }
+    .modal-actions { justify-content: flex-end; padding: var(--space-sm); border-top: var(--rule-hairline) solid var(--border); }
+    .toast-region { position: fixed; right: var(--space-sm); bottom: var(--space-sm); z-index: 30; width: min(22rem, calc(100% - 2rem)); display: grid; gap: var(--space-2xs); }
+    .toast { padding: var(--space-xs) var(--space-sm); border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-sm); background: var(--popover); color: var(--popover-foreground); box-shadow: var(--shadow); font-size: var(--text-xs); animation: toast-in var(--dur-medium) var(--ease-out); }
+    .toast.success { border-color: var(--success); }
+    .toast.error { border-color: var(--destructive); }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes toast-in { from { opacity: 0; transform: translateY(0.5rem); } to { opacity: 1; transform: translateY(0); } }
+    @media (max-width: 900px) {
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .metric:nth-child(2) { border-right: 0; }
+      .metric:nth-child(-n+2) { border-bottom: var(--rule-hairline) solid var(--border); }
+      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .stat:nth-child(3n) { border-right: var(--rule-hairline) solid var(--border); }
+      .stat:nth-child(2n) { border-right: 0; }
+      .stat:nth-last-child(-n+3) { border-bottom: var(--rule-hairline) solid var(--border); }
+      .stat:nth-last-child(-n+2) { border-bottom: 0; }
+      .lower-grid { grid-template-columns: minmax(0, 1fr); }
+      .desktop-table { display: none; }
+      .account-cards { display: grid; }
+      table { min-width: 0; }
+    }
+    @media (max-width: 600px) {
+      .shell { padding: var(--space-sm); }
+      .page-head, .section-head { align-items: stretch; flex-direction: column; }
+      .head-actions, .toolbar { width: 100%; }
+      .toolbar { justify-content: flex-start; }
+      .search { width: 100%; }
+      .metrics, .stats, .form-grid, .account-card-meta { grid-template-columns: minmax(0, 1fr); }
+      .metric { border-right: 0; border-bottom: var(--rule-hairline) solid var(--border); }
+      .metric:nth-child(2) { border-bottom: var(--rule-hairline) solid var(--border); }
+      .metric:last-child { border-bottom: 0; }
+      .stat, .stat:nth-child(2n), .stat:nth-child(3n) { border-right: 0; border-bottom: var(--rule-hairline) solid var(--border); }
+      .stat:last-child { border-bottom: 0; }
+      .field.full { grid-column: auto; }
+      .modal-actions .button { flex: 1; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell stack">
+    <header class="page-head">
+      <div>
+        <h1>账号守护</h1>
+        <p>被动观测每个账号的输出 Token/s 与失败情况 · 软/硬/失败三档自动停用或删除 · 不依赖出口节点</p>
+      </div>
+      <div class="head-actions">
+        <span class="status-line"><span id="service-dot" class="status-dot"></span><span id="service-text">正在连接</span></span>
+        <button id="theme-button" class="button icon ghost" type="button" title="切换深浅色" aria-label="切换深浅色">◐</button>
+        <button id="refresh-button" class="button" type="button">刷新</button>
+      </div>
+    </header>
+
+    <section class="metrics" aria-label="守护概览">
+      <div class="metric"><div class="metric-label">守护状态</div><div id="metric-service" class="metric-value">-</div><div id="metric-updated" class="metric-detail">等待状态</div></div>
+      <div class="metric"><div class="metric-label">可用账号</div><div id="metric-enabled" class="metric-value">-</div><div id="metric-total" class="metric-detail">启用 / 全部 xAI 账号</div></div>
+      <div class="metric"><div class="metric-label">已处理账号</div><div id="metric-acted" class="metric-value">-</div><div id="metric-acted-detail" class="metric-detail">停用 + 删除</div></div>
+      <div class="metric"><div class="metric-label">运行模式</div><div id="metric-mode" class="metric-value">-</div><div id="metric-mode-detail" class="metric-detail">-</div></div>
+    </section>
+
+    <section class="section" aria-labelledby="accounts-title">
+      <div class="section-head">
+        <div><h2 id="accounts-title">账号状态</h2><p>仅在账号被实际调用时评估；闲置账号不会产生观测</p></div>
+        <div class="toolbar">
+          <input id="account-search" class="search" type="search" placeholder="搜索账号或邮箱" aria-label="搜索账号">
+        </div>
+      </div>
+      <div class="table-wrap desktop-table">
+        <table>
+          <thead><tr>
+            <th>账号</th><th>状态</th><th>分类</th><th class="numeric">Token/s</th><th class="numeric">软/失败计数</th><th>动作</th><th>最近观测</th><th>原因</th>
+          </tr></thead>
+          <tbody id="accounts-body"><tr><td colspan="8" class="loading">正在加载账号</td></tr></tbody>
+        </table>
+      </div>
+      <div id="account-cards" class="account-cards" aria-label="账号卡片"></div>
+    </section>
+
+    <section class="section" aria-labelledby="statistics-title">
+      <div class="section-head"><div><h2 id="statistics-title">观测统计</h2><p id="statistics-since">统计插件启动后的被动观测与动作</p></div></div>
+      <div id="statistics-grid" class="stats"></div>
+    </section>
+
+    <div class="lower-grid">
+      <section class="section" aria-labelledby="events-title">
+        <div class="section-head"><div><h2 id="events-title">最近事件</h2><p>停用、删除、抑制与观测模式记录</p></div></div>
+        <div id="events-list" class="events"><div class="loading">正在加载事件</div></div>
+      </section>
+      <section class="section" aria-labelledby="policy-title">
+        <div class="section-head"><div><h2 id="policy-title">守护策略</h2><p>修改后由 CPA 插件热加载</p></div><button id="edit-policy" class="button" type="button">编辑</button></div>
+        <dl id="policy-view" class="policy"></dl>
+      </section>
+    </div>
+  </main>
+
+  <div id="policy-modal" class="modal-layer" hidden>
+    <section class="modal wide" role="dialog" aria-modal="true" aria-labelledby="policy-modal-title">
+      <div class="modal-head"><div><h3 id="policy-modal-title">守护策略</h3><p>三档阈值各自独立配置动作；删除不可逆，建议先用观测模式试跑</p></div><button class="button icon ghost" type="button" data-close="policy-modal" aria-label="关闭">×</button></div>
+      <form id="policy-form">
+        <div id="policy-error" class="form-error" hidden></div>
+        <div class="modal-body form-grid">
+          <div class="field"><label for="policy-soft">软阈值 Token/s</label><input id="policy-soft" type="number" min="1" max="99999" step="1" required><small>Token/s 越高说明降智越严重</small></div>
+          <div class="field"><label for="policy-hard">硬阈值 Token/s</label><input id="policy-hard" type="number" min="2" max="100000" step="1" required><small>必须大于软阈值</small></div>
+          <div class="field"><label for="policy-soft-count">连续软阈值次数</label><input id="policy-soft-count" type="number" min="1" max="50" required><small>任意一次健康观测清零</small></div>
+          <div class="field"><label for="policy-fail-count">连续失败次数</label><input id="policy-fail-count" type="number" min="1" max="50" required><small>任意一次非失败观测清零</small></div>
+          <div class="field"><label for="policy-soft-action">软阈值动作</label><select id="policy-soft-action"><option value="disable">停用账号</option><option value="delete">删除账号</option><option value="none">不处理</option></select></div>
+          <div class="field"><label for="policy-hard-action">硬阈值动作</label><select id="policy-hard-action"><option value="disable">停用账号</option><option value="delete">删除账号</option><option value="none">不处理</option></select><small>硬阈值单次命中立即执行</small></div>
+          <div class="field"><label for="policy-fail-action">连续失败动作</label><select id="policy-fail-action"><option value="disable">停用账号</option><option value="delete">删除账号</option><option value="none">不处理</option></select></div>
+          <div class="field"><label for="policy-min-keep">最低保留账号数</label><input id="policy-min-keep" type="number" min="0" max="10000" required><small>执行后启用账号数低于该值时抑制动作</small></div>
+          <div class="field full check-row"><div><label for="policy-dry-run">观测模式（dry-run）</label><p class="help">只记录「将执行」事件，不实际停用或删除</p></div><input id="policy-dry-run" type="checkbox"></div>
+        </div>
+        <div class="modal-actions"><button class="button" type="button" data-close="policy-modal">取消</button><button id="save-policy" class="button primary" type="submit">保存策略</button></div>
+      </form>
+    </section>
+  </div>
+
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+  <script>
+  (() => {
+    'use strict';
+    const MANAGEMENT_API = '/v0/management/grok2api-account-guard/api';
+    const state = { status: null, accounts: [], search: '', loading: false, autoTimer: 0 };
+    const $ = (id) => document.getElementById(id);
+    const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
+    const number = (value) => new Intl.NumberFormat('zh-CN').format(Number(value || 0));
+    const actionName = (action) => ({disable:'停用账号', delete:'删除账号', none:'不处理'})[action] || '-';
+    const classificationName = (value) => ({healthy:'健康', soft:'软阈值', hard:'硬阈值', failed:'失败', unknown:'未知'})[value] || '未观测';
+    const classificationTone = (value) => ({healthy:'good', soft:'warn', hard:'bad', failed:'bad'})[value] || 'muted';
+    const actedName = (value) => ({disabled:'已停用', deleted:'已删除'})[value] || '';
+    const eventName = (value) => ({
+      account_disabled:'账号已停用',
+      account_deleted:'账号已删除',
+      action_suppressed:'动作已抑制',
+      dry_run_would_act:'观测模式 · 将执行',
+      account_delete_skipped:'删除已跳过',
+      account_disable_failed:'停用失败',
+      action_none:'命中但策略为不处理',
+      account_action_cleared:'已清除动作标记',
+      usage_unmapped:'usage 未映射账号'
+    })[value] || value;
+    const relative = (epoch) => {
+      if (!epoch) return '-';
+      const sec = Math.max(0, Math.round(Date.now() / 1000 - Number(epoch)));
+      if (sec < 60) return sec + ' 秒前';
+      if (sec < 3600) return Math.floor(sec / 60) + ' 分钟前';
+      return Math.floor(sec / 3600) + ' 小时前';
+    };
+    const clock = (epoch) => {
+      if (!epoch) return '-';
+      const date = new Date(Number(epoch) * 1000);
+      return Number.isNaN(date.getTime()) ? '-' : new Intl.DateTimeFormat('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'}).format(date);
+    };
+    function managementKey() {
+      const decodeStoredValue = (storageKey) => {
+        let raw = localStorage.getItem(storageKey) || '';
+        if (!raw) return null;
+        if (raw.startsWith('enc::v1::')) {
+          const encoded = atob(raw.slice(9));
+          const value = Uint8Array.from(encoded, (char) => char.charCodeAt(0));
+          const key = new TextEncoder().encode('cli-proxy-api-webui::secure-storage|' + location.host + '|' + navigator.userAgent);
+          for (let index = 0; index < value.length; index += 1) value[index] ^= key[index % key.length];
+          raw = new TextDecoder().decode(value);
+        }
+        try { return JSON.parse(raw); } catch (_) { return raw; }
+      };
+      try {
+        for (const storageKey of ['authToken', 'managementKey', 'cli-proxy-auth']) {
+          const decoded = decodeStoredValue(storageKey);
+          if (typeof decoded === 'string' && decoded) return decoded;
+          if (decoded && typeof decoded === 'object') {
+            const key = decoded.state?.managementKey || decoded.managementKey || decoded.token;
+            if (typeof key === 'string' && key) return key;
+          }
+        }
+        return '';
+      } catch (_) { return ''; }
+    }
+    async function api(path, options = {}) {
+      const key = managementKey();
+      if (!key) throw new Error('CPA 管理密钥未持久化，请重新登录管理面板并勾选“记住密码”');
+      const response = await fetch(MANAGEMENT_API, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json','Accept':'application/json','Authorization':'Bearer ' + key,'X-Grok2API-Account-Guard-UI':'1'},
+        body: JSON.stringify({method: options.method || 'GET', path, body: options.body}),
+        cache: 'no-store'
+      });
+      const raw = await response.text();
+      let payload = {};
+      try { payload = raw ? JSON.parse(raw) : {}; } catch (_) { throw new Error('服务返回了无效数据'); }
+      if (!response.ok || payload.error) throw new Error(payload?.error?.message || ('请求失败 (HTTP ' + response.status + ')'));
+      return payload.data ?? payload;
+    }
+    function toast(message, kind = 'success') {
+      const node = document.createElement('div');
+      node.className = 'toast ' + kind;
+      node.textContent = message;
+      $('toast-region').appendChild(node);
+      window.setTimeout(() => node.remove(), 3200);
+    }
+    function busy(button, value) {
+      if (!button) return;
+      button.disabled = value;
+      button.classList.toggle('busy', value);
+    }
+    function setService(ok, text) {
+      $('service-dot').className = 'status-dot ' + (ok ? 'good' : 'bad');
+      $('service-text').textContent = text;
+    }
+    async function load(silent = false) {
+      if (state.loading) return;
+      state.loading = true;
+      busy($('refresh-button'), true);
+      try {
+        const status = await api('/status');
+        state.status = status;
+        state.accounts = Array.isArray(status.accounts) ? status.accounts : [];
+        render();
+        setService(true, '账号守护运行中');
+      } catch (error) {
+        setService(false, '连接失败');
+        $('accounts-body').innerHTML = '<tr><td colspan="8" class="error-state">' + esc(error.message) + '</td></tr>';
+        if (!silent) toast(error.message, 'error');
+      } finally {
+        state.loading = false;
+        busy($('refresh-button'), false);
+      }
+    }
+    function render() {
+      renderMetrics(); renderAccounts(); renderStatistics(); renderEvents(); renderPolicy();
+    }
+    function renderMetrics() {
+      const status = state.status || {};
+      const config = status.config || {};
+      const fresh = status.available && status.updatedAt && (Date.now() / 1000 - status.updatedAt < 300);
+      const present = state.accounts.filter((a) => a.present);
+      const enabled = present.filter((a) => !a.disabled).length;
+      const acted = state.accounts.filter((a) => a.action).length;
+      $('metric-service').textContent = status.available ? (fresh ? '运行中' : '等待观测') : '不可用';
+      $('metric-service').className = 'metric-value ' + (status.available ? 'tone-good' : 'tone-bad');
+      $('metric-updated').textContent = status.updatedAt ? '更新于 ' + relative(status.updatedAt) : '没有状态数据';
+      $('metric-enabled').textContent = enabled + ' / ' + present.length;
+      $('metric-acted').textContent = String(acted);
+      $('metric-acted').className = 'metric-value ' + (acted ? 'tone-warn' : 'tone-good');
+      const actions = status.statistics?.actions || {};
+      $('metric-acted-detail').textContent = '停用 ' + number(actions.disabled) + ' · 删除 ' + number(actions.deleted);
+      $('metric-mode').textContent = config.dry_run ? '观测模式' : '执行模式';
+      $('metric-mode').className = 'metric-value ' + (config.dry_run ? 'tone-warn' : 'tone-good');
+      $('metric-mode-detail').textContent = '软 ' + actionName(config.soft_action) + ' · 硬 ' + actionName(config.hard_action) + ' · 失败 ' + actionName(config.fail_action);
+    }
+    function filteredAccounts() {
+      const query = state.search.trim().toLowerCase();
+      if (!query) return state.accounts;
+      return state.accounts.filter((a) => [a.name, a.email, a.key].some((value) => String(value || '').toLowerCase().includes(query)));
+    }
+    function accountStatusBadges(account) {
+      const parts = [];
+      if (!account.present) parts.push('<span class="badge bad">文件已移除</span>');
+      else if (account.disabled) parts.push('<span class="badge bad">已停用</span>');
+      else parts.push('<span class="badge good">启用中</span>');
+      if (account.expired) parts.push('<span class="badge warn">令牌过期</span>');
+      return parts.join('');
+    }
+    function renderAccounts() {
+      const items = filteredAccounts();
+      const body = $('accounts-body');
+      const cards = $('account-cards');
+      if (!items.length) {
+        body.innerHTML = '<tr><td colspan="8" class="empty">没有账号观测数据</td></tr>';
+        cards.innerHTML = '<div class="empty">没有账号观测数据</div>';
+        return;
+      }
+      body.innerHTML = items.map((account) => {
+        const tone = classificationTone(account.last_classification);
+        return '<tr>'
+          + '<td><div class="account-name">' + esc(account.name || account.key) + '</div>'
+          + (account.email ? '<div class="subtext">' + esc(account.email) + '</div>' : '') + '</td>'
+          + '<td>' + accountStatusBadges(account) + '</td>'
+          + '<td><span class="badge ' + tone + '">' + esc(classificationName(account.last_classification)) + '</span></td>'
+          + '<td class="numeric">' + (account.last_output_tps ? Number(account.last_output_tps).toFixed(1) : '-') + '</td>'
+          + '<td class="numeric">' + number(account.soft_strikes) + ' / ' + number(account.fail_strikes) + '</td>'
+          + '<td>' + (account.action ? '<span class="badge bad">' + esc(actedName(account.action)) + '</span>' : '<span class="badge muted">未处理</span>') + '</td>'
+          + '<td>' + esc(relative(account.last_observed_at)) + '<div class="subtext">共 ' + number(account.observed_count) + ' 次</div></td>'
+          + '<td><div class="subtext">' + esc(account.reason || '-') + '</div></td>'
+          + '</tr>';
+      }).join('');
+      cards.innerHTML = items.map((account) => {
+        const tone = classificationTone(account.last_classification);
+        return '<article class="account-card">'
+          + '<div class="account-card-head"><div><div class="account-name">' + esc(account.name || account.key) + '</div>'
+          + (account.email ? '<div class="subtext">' + esc(account.email) + '</div>' : '') + '</div>'
+          + '<div>' + accountStatusBadges(account) + '</div></div>'
+          + '<div class="account-card-meta">'
+          + '<div>分类<strong><span class="badge ' + tone + '">' + esc(classificationName(account.last_classification)) + '</span></strong></div>'
+          + '<div>Token/s<strong>' + (account.last_output_tps ? Number(account.last_output_tps).toFixed(1) : '-') + '</strong></div>'
+          + '<div>软/失败计数<strong>' + number(account.soft_strikes) + ' / ' + number(account.fail_strikes) + '</strong></div>'
+          + '<div>动作<strong>' + esc(actedName(account.action) || '未处理') + '</strong></div>'
+          + '<div>最近观测<strong>' + esc(relative(account.last_observed_at)) + '</strong></div>'
+          + '<div>观测次数<strong>' + number(account.observed_count) + '</strong></div>'
+          + '</div>'
+          + (account.reason ? '<div class="subtext">' + esc(account.reason) + '</div>' : '')
+          + '</article>';
+      }).join('');
+    }
+    function renderStatistics() {
+      const stats = state.status?.statistics || {};
+      const obs = stats.observations || {};
+      const actions = stats.actions || {};
+      $('statistics-since').textContent = stats.started_at ? '自 ' + clock(stats.started_at) + ' 起的被动观测' : '统计插件启动后的被动观测与动作';
+      const cells = [
+        ['观测总数', obs.total, '累计 usage 事件'],
+        ['健康', obs.healthy, '低于软阈值'],
+        ['软阈值', obs.soft, '达到软阈值'],
+        ['硬阈值', obs.hard, '达到硬阈值'],
+        ['失败', obs.failed, 'failed=true'],
+        ['未映射', obs.unmapped, '无法定位账号'],
+        ['已停用', actions.disabled, '执行的停用动作'],
+        ['已删除', actions.deleted, '执行的删除动作'],
+        ['已抑制', actions.suppressed, '安全阀拦截'],
+      ];
+      $('statistics-grid').innerHTML = cells.map(([label, value, hint]) =>
+        '<div class="stat">' + esc(label) + '<strong>' + number(value) + '</strong><small>' + esc(hint) + '</small></div>'
+      ).join('') + '<div class="stat">观测模式命中<strong>' + number(actions.dry_run) + '</strong><small>dry-run 记录的将执行动作</small></div>'
+        + '<div class="stat">输出 Token<strong>' + number(obs.output_tokens) + '</strong><small>累计观测到的输出量</small></div>';
+    }
+    function renderEvents() {
+      const events = (state.status?.recentEvents || []).slice().reverse();
+      const list = $('events-list');
+      if (!events.length) {
+        list.innerHTML = '<div class="empty">还没有事件</div>';
+        return;
+      }
+      list.innerHTML = events.map((event) => {
+        const label = eventName(event.event);
+        const who = event.account_name || event.account_key || '';
+        const bits = [];
+        if (event.tier) bits.push(({soft:'软阈值', hard:'硬阈值', fail:'连续失败'})[event.tier] || event.tier);
+        if (event.action) bits.push(actionName(event.action));
+        if (event.output_tps) bits.push(Number(event.output_tps).toFixed(1) + ' Token/s');
+        return '<div class="event"><div><strong>' + esc(label) + (who ? ' · ' + esc(who) : '') + '</strong>'
+          + (bits.length ? '<small>' + esc(bits.join(' · ')) + '</small>' : '')
+          + (event.reason ? '<small>' + esc(event.reason) + '</small>' : '') + '</div>'
+          + '<time>' + esc(relative(event.ts)) + '</time></div>';
+      }).join('');
+    }
+    function renderPolicy() {
+      const config = state.status?.config || {};
+      const rows = [
+        ['软阈值 Token/s', config.soft_tps],
+        ['硬阈值 Token/s', config.hard_tps],
+        ['连续软阈值次数', config.consecutive_soft],
+        ['连续失败次数', config.consecutive_fail],
+        ['软阈值动作', actionName(config.soft_action)],
+        ['硬阈值动作', actionName(config.hard_action)],
+        ['连续失败动作', actionName(config.fail_action)],
+        ['最低保留账号数', config.min_keep_accounts],
+        ['观测模式', config.dry_run ? '开启' : '关闭'],
+      ];
+      $('policy-view').innerHTML = rows.map(([label, value]) =>
+        '<div><dt>' + esc(label) + '</dt><dd>' + esc(value ?? '-') + '</dd></div>'
+      ).join('');
+    }
+    function openPolicy() {
+      const config = state.status?.config || {};
+      $('policy-soft').value = config.soft_tps ?? 500;
+      $('policy-hard').value = config.hard_tps ?? 1000;
+      $('policy-soft-count').value = config.consecutive_soft ?? 2;
+      $('policy-fail-count').value = config.consecutive_fail ?? 3;
+      $('policy-soft-action').value = config.soft_action || 'disable';
+      $('policy-hard-action').value = config.hard_action || 'delete';
+      $('policy-fail-action').value = config.fail_action || 'disable';
+      $('policy-min-keep').value = config.min_keep_accounts ?? 2;
+      $('policy-dry-run').checked = Boolean(config.dry_run);
+      $('policy-error').hidden = true;
+      $('policy-modal').hidden = false;
+    }
+    async function savePolicy(event) {
+      event.preventDefault();
+      const body = {
+        soft_tps: Number($('policy-soft').value),
+        hard_tps: Number($('policy-hard').value),
+        consecutive_soft: Number($('policy-soft-count').value),
+        consecutive_fail: Number($('policy-fail-count').value),
+        soft_action: $('policy-soft-action').value,
+        hard_action: $('policy-hard-action').value,
+        fail_action: $('policy-fail-action').value,
+        min_keep_accounts: Number($('policy-min-keep').value),
+        dry_run: $('policy-dry-run').checked
+      };
+      busy($('save-policy'), true);
+      try {
+        await api('/policy', {method: 'PUT', body});
+        $('policy-modal').hidden = true;
+        toast('策略已保存');
+        await load(true);
+      } catch (error) {
+        const box = $('policy-error');
+        box.textContent = error.message;
+        box.hidden = false;
+      } finally {
+        busy($('save-policy'), false);
+      }
+    }
+    function applyTheme(theme) {
+      document.documentElement.dataset.theme = theme;
+      try { localStorage.setItem('account-guard-theme', theme); } catch (_) {}
+    }
+    function bind() {
+      $('refresh-button').addEventListener('click', () => load());
+      $('edit-policy').addEventListener('click', openPolicy);
+      $('policy-form').addEventListener('submit', savePolicy);
+      $('account-search').addEventListener('input', (event) => { state.search = event.target.value; renderAccounts(); });
+      $('theme-button').addEventListener('click', () => {
+        applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+      });
+      document.addEventListener('click', (event) => {
+        const close = event.target.closest('[data-close]');
+        if (close) $(close.dataset.close).hidden = true;
+      });
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') $('policy-modal').hidden = true;
+      });
+    }
+    try {
+      const saved = localStorage.getItem('account-guard-theme');
+      if (saved) applyTheme(saved);
+      else if (window.matchMedia('(prefers-color-scheme: dark)').matches) applyTheme('dark');
+    } catch (_) {}
+    bind();
+    load();
+    state.autoTimer = window.setInterval(() => load(true), 15000);
+  })();
+  </script>
+</body>
+</html>
