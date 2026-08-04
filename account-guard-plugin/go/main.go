@@ -390,26 +390,21 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 }
 
 // buildAccountViews joins live CPA accounts with guard state. Records whose
-// account file is gone (deleted by this plugin) are kept as history.
+// account file is gone (deleted by this plugin or by hand) are dropped: the
+// list only shows credentials CPA still knows about.
 func buildAccountViews() []map[string]any {
+	auths, err := listAllAuths()
+	if err != nil {
+		return []map[string]any{}
+	}
 	records := map[string]*accountRecord{}
 	for _, rec := range store.listAccounts() {
 		records[rec.Key] = rec
 	}
-	out := make([]map[string]any, 0, len(records))
-	seen := map[string]bool{}
-	if auths, err := listAuthFiles(); err == nil {
-		for _, a := range auths {
-			key := accountKey(a)
-			seen[key] = true
-			out = append(out, accountView(key, a, records[key], true))
-		}
-	}
-	for key, rec := range records {
-		if seen[key] {
-			continue
-		}
-		out = append(out, accountView(key, authFile{Name: rec.Name, Email: rec.Email, Index: rec.Index}, rec, false))
+	out := make([]map[string]any, 0, len(auths))
+	for _, a := range auths {
+		key := accountKey(a)
+		out = append(out, accountView(key, a, records[key]))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return fmt.Sprint(out[i]["name"]) < fmt.Sprint(out[j]["name"])
@@ -417,15 +412,16 @@ func buildAccountViews() []map[string]any {
 	return out
 }
 
-func accountView(key string, a authFile, rec *accountRecord, present bool) map[string]any {
+func accountView(key string, a authFile, rec *accountRecord) map[string]any {
 	view := map[string]any{
-		"key":      key,
-		"name":     a.Name,
-		"email":    a.Email,
-		"index":    a.Index,
-		"present":  present,
+		"key":   key,
+		"name":  a.Name,
+		"email": a.Email,
+		"index": a.Index,
+		// Only live accounts reach this point; the field stays for the UI.
+		"present":  true,
 		"disabled": a.Disabled,
-		"expired":  present && isAuthExpired(a),
+		"expired":  isAuthExpired(a),
 	}
 	if rec == nil {
 		rec = &accountRecord{}

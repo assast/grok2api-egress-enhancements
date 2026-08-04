@@ -528,6 +528,7 @@
         const who = event.account_name || event.account_key || '';
         const bits = [];
         if (event.source) bits.push(sourceName(event.source));
+        if (event.proxy) bits.push('代理 ' + event.proxy);
         if (event.tier) bits.push(({soft:'软阈值', hard:'硬阈值', fail:'连续失败'})[event.tier] || event.tier);
         if (event.action) bits.push(actionName(event.action));
         if (event.output_tps) bits.push(Number(event.output_tps).toFixed(1) + ' Token/s');

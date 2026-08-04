@@ -88,6 +88,7 @@ type guardEvent struct {
 	Classification string  `json:"classification,omitempty"`
 	OutputTPS      float64 `json:"output_tps,omitempty"`
 	Source         string  `json:"source,omitempty"`
+	Proxy          string  `json:"proxy,omitempty"`
 	Reason         string  `json:"reason,omitempty"`
 	DryRun         bool    `json:"dry_run,omitempty"`
 }

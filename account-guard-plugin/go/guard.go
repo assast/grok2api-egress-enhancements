@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -67,6 +68,46 @@ func anyInt(v any) int64 {
 	default:
 		return 0
 	}
+}
+
+// Labels used when an observation has no proxy URL to report.
+const (
+	proxyUnbound = "未绑定代理"
+	proxyDirect  = "直连"
+)
+
+// maskProxyURL keeps scheme + host:port and replaces any credentials. Events are
+// rendered in the management UI and persisted to the state file, so the proxy
+// password must never travel with them.
+func maskProxyURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		// Not a full URL (e.g. "host:port"); strip a credentials prefix if present.
+		if at := strings.LastIndex(raw, "@"); at >= 0 {
+			return "***@" + raw[at+1:]
+		}
+		return raw
+	}
+	host := u.Host
+	if u.User != nil {
+		host = "***@" + host
+	}
+	if u.Scheme == "" {
+		return host
+	}
+	return u.Scheme + "://" + host
+}
+
+// proxyDisplay renders an account's proxy binding for the event stream.
+func proxyDisplay(raw string) string {
+	if masked := maskProxyURL(raw); masked != "" {
+		return masked
+	}
+	return proxyUnbound
 }
 
 type usageObservation struct {
@@ -187,6 +228,7 @@ type observation struct {
 	FirstTokenMs   int64
 	Failed         bool
 	Source         string
+	Proxy          string
 	Detail         string
 }
 
@@ -216,6 +258,9 @@ func handleAccountUsage(store *stateStore, record map[string]any) {
 		FirstTokenMs:   usage.FirstTokenMs,
 		Failed:         usage.Failed,
 		Source:         sourcePassive,
+		// CPA routes this account's upstream calls through its proxy binding;
+		// that binding is the egress this request actually used.
+		Proxy: proxyDisplay(auth.ProxyURL),
 	})
 }
 
@@ -278,6 +323,7 @@ func applyObservation(store *stateStore, auth authFile, obs observation) {
 		Classification: obs.Classification,
 		OutputTPS:      obs.TPS,
 		Source:         obs.Source,
+		Proxy:          obs.Proxy,
 		Reason:         observationDetail(pol, rec, obs),
 	})
 
@@ -341,6 +387,7 @@ func applyAccountAction(store *stateStore, tier string, auth authFile, rec *acco
 		Classification: obs.Classification,
 		OutputTPS:      obs.TPS,
 		Source:         obs.Source,
+		Proxy:          obs.Proxy,
 	}
 	emit := func(name, why string, dryRun bool) {
 		ev := base

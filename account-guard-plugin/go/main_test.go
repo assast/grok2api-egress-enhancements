@@ -533,6 +533,8 @@ func TestRenderStatusPage(t *testing.T) {
 		// event stream additions
 		"account_observed",
 		"events-actions-only",
+		// the proxy each request actually used
+		"event.proxy",
 	} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("missing %q", want)
@@ -711,5 +713,111 @@ func TestSoftObservationEventShowsStrikeProgress(t *testing.T) {
 	}
 	if !strings.Contains(last.Reason, "1/3") {
 		t.Fatalf("soft observation must show strike progress, reason=%q", last.Reason)
+	}
+}
+
+// --- 事件里的实际出口代理 ---
+
+func TestMaskProxyURLHidesCredentials(t *testing.T) {
+	cases := map[string]string{
+		"":                                   "",
+		"   ":                                "",
+		"http://1.2.3.4:8080":                "http://1.2.3.4:8080",
+		"http://user:pass@1.2.3.4:8080":      "http://***@1.2.3.4:8080",
+		"socks5://u:p@node.example.com:1080": "socks5://***@node.example.com:1080",
+		"1.2.3.4:8080":                       "1.2.3.4:8080",
+		"u:p@1.2.3.4:8080":                   "***@1.2.3.4:8080",
+	}
+	for in, want := range cases {
+		if got := maskProxyURL(in); got != want {
+			t.Fatalf("maskProxyURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := proxyDisplay(""); got != proxyUnbound {
+		t.Fatalf("proxyDisplay(\"\") = %q, want %q", got, proxyUnbound)
+	}
+}
+
+func TestPassiveEventsCarryTheProxyUsed(t *testing.T) {
+	s := newTestStore(t, func(p *policyConfig) {
+		p.HardAction = accountActionDisable
+		p.MinKeepAccounts = 0
+	})
+	h := newFakeHost(t, "xai-test.json", 5)
+	h.auth.ProxyURL = "http://user:secret@10.0.0.9:8080"
+
+	handleAccountUsage(s, usageRecord(1200, 1000, 0, false)) // hard -> disable
+	events := s.events()
+	if len(events) != 2 {
+		t.Fatalf("expected observation + action events, got %#v", events)
+	}
+	for _, ev := range events {
+		if ev.Proxy != "http://***@10.0.0.9:8080" {
+			t.Fatalf("event %q missing the proxy actually used: %#v", ev.Event, ev)
+		}
+		if strings.Contains(ev.Proxy, "secret") {
+			t.Fatalf("proxy credentials must never reach the event stream: %#v", ev)
+		}
+	}
+}
+
+func TestEventsLabelAccountsWithoutProxyBinding(t *testing.T) {
+	s := newTestStore(t, func(p *policyConfig) { p.MinKeepAccounts = 0 })
+	newFakeHost(t, "xai-test.json", 5) // no ProxyURL on the auth
+
+	handleAccountUsage(s, usageRecord(100, 1000, 0, false))
+	if got := s.events()[0].Proxy; got != proxyUnbound {
+		t.Fatalf("event proxy = %q, want %q", got, proxyUnbound)
+	}
+}
+
+func TestProbeEventsCarryTheProbeProxy(t *testing.T) {
+	s := newTestStore(t, func(p *policyConfig) { p.MinKeepAccounts = 0 })
+	h := newFakeHost(t, "xai-test.json", 5)
+	stubAuthList(t, h.auth)
+	stubProbe(t, probeResult{Classification: "healthy", TPS: 90, OutputTokens: 400, DurationMs: 4400, Proxy: "http://***@10.0.0.9:8080"})
+
+	if _, err := runQualityProbes(s, []string{"name:xai-test.json"}); err != nil {
+		t.Fatal(err)
+	}
+	last := s.events()[len(s.events())-1]
+	if last.Source != sourceProbe || last.Proxy != "http://***@10.0.0.9:8080" {
+		t.Fatalf("probe event must report the proxy it used: %#v", last)
+	}
+}
+
+// --- 账号列表只显示存活账号 ---
+
+func TestAccountListDropsRemovedFiles(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
+	live := authFile{Name: "xai-live.json", Index: "0"}
+	gone := authFile{Name: "xai-gone.json", Index: "1"}
+	for _, a := range []authFile{live, gone} {
+		if _, err := store.upsertAccount(a, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stubAuthList(t, live)
+
+	views := buildAccountViews()
+	if len(views) != 1 {
+		t.Fatalf("removed account files must not be listed, got %#v", views)
+	}
+	if views[0]["key"] != "name:xai-live.json" {
+		t.Fatalf("unexpected account view: %#v", views[0])
+	}
+}
+
+func TestAccountListEmptyWhenHostListFails(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
+	if _, err := store.upsertAccount(authFile{Name: "xai-live.json", Index: "0"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	orig := listAllAuths
+	t.Cleanup(func() { listAllAuths = orig })
+	listAllAuths = func() ([]authFile, error) { return nil, http.ErrServerClosed }
+
+	if views := buildAccountViews(); len(views) != 0 {
+		t.Fatalf("unknown account list must not be rendered from stale state, got %#v", views)
 	}
 }

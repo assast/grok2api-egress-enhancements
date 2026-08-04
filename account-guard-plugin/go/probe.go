@@ -29,6 +29,7 @@ type probeResult struct {
 	DurationMs     int64   `json:"duration_ms"`
 	FirstTokenMs   int64   `json:"first_token_ms"`
 	Model          string  `json:"model,omitempty"`
+	Proxy          string  `json:"proxy,omitempty"`
 	Error          string  `json:"error,omitempty"`
 }
 
@@ -80,7 +81,7 @@ func applyGrokClientHeaders(req *http.Request, auth authFile) {
 // probeAccountQuality runs one real streaming completion with this account's
 // own credentials, through the account's own proxy_url when it has one.
 func probeAccountQuality(pol policyConfig, auth authFile) probeResult {
-	res := probeResult{Model: pol.ProbeModel}
+	res := probeResult{Model: pol.ProbeModel, Proxy: proxyDisplay(auth.ProxyURL)}
 
 	token, _ := auth.Raw["access_token"].(string)
 	if strings.TrimSpace(token) == "" {
@@ -126,6 +127,14 @@ func probeAccountQuality(pol policyConfig, auth authFile) probeResult {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 	applyGrokClientHeaders(req, auth)
+	// Without a binding the transport falls back to the environment proxy;
+	// resolve it so the reported egress is the one really used.
+	if strings.TrimSpace(auth.ProxyURL) == "" {
+		res.Proxy = proxyDirect
+		if u, perr := http.ProxyFromEnvironment(req); perr == nil && u != nil {
+			res.Proxy = maskProxyURL(u.String())
+		}
+	}
 
 	start := time.Now()
 	resp, err := client.Do(req)
@@ -267,6 +276,7 @@ func runQualityProbes(store *stateStore, keys []string) ([]probeResult, error) {
 			FirstTokenMs:   res.FirstTokenMs,
 			Failed:         failed,
 			Source:         sourceProbe,
+			Proxy:          res.Proxy,
 			Detail:         detail,
 		})
 		out = append(out, res)
