@@ -75,7 +75,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.0.5"
+	pluginVersion       = "1.0.7"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -104,7 +104,11 @@ type lifecycleRequest struct {
 }
 
 type pluginConfig struct {
-	StateFile string `yaml:"state_file" json:"state_file"`
+	StateFile          string   `yaml:"state_file" json:"state_file"`
+	RotationURL        string   `yaml:"rotation_url" json:"rotation_url"`
+	RotationTokenEnv   string   `yaml:"rotation_token_env" json:"rotation_token_env"`
+	RotationTimeoutSec int      `yaml:"rotation_timeout_seconds" json:"rotation_timeout_seconds"`
+	RotatableNodeIDs   []string `yaml:"rotatable_node_ids" json:"rotatable_node_ids"`
 }
 
 type registration struct {
@@ -114,8 +118,10 @@ type registration struct {
 }
 
 type registrationCapabilities struct {
-	ManagementAPI bool `json:"management_api"`
-	UsagePlugin   bool `json:"usage_plugin"`
+	ManagementAPI      bool `json:"management_api"`
+	UsagePlugin        bool `json:"usage_plugin"`
+	Scheduler          bool `json:"scheduler"`
+	RequestInterceptor bool `json:"request_interceptor"`
 }
 
 type managementRegistration struct {
@@ -160,6 +166,9 @@ var (
 	workerCancel  context.CancelFunc
 	currentConfig atomic.Value // pluginConfig
 	startedAt     = time.Now().UTC()
+	// hostCall is replaceable in unit tests. Production always uses the C ABI
+	// callback implemented by callHost below.
+	hostCall = callHost
 )
 
 func main() {}
@@ -213,6 +222,10 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 func cliproxyPluginShutdown() {
 	if workerCancel != nil {
 		workerCancel()
+		workerCancel = nil
+	}
+	if store != nil {
+		_ = store.Flush()
 	}
 }
 
@@ -232,6 +245,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleManagement(request)
 	case pluginabi.MethodUsageHandle:
 		return handleUsage(request)
+	case pluginabi.MethodSchedulerPick:
+		return handleSchedulerPick(request)
+	case pluginabi.MethodRequestInterceptBefore:
+		return handleRequestIntercept(request, false)
+	case pluginabi.MethodRequestInterceptAfter:
+		return handleRequestIntercept(request, true)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -252,6 +271,9 @@ func configure(raw []byte) error {
 	}
 	if strings.TrimSpace(cfg.StateFile) == "" {
 		cfg.StateFile = defaultStateFile
+	}
+	if cfg.RotationTimeoutSec <= 0 {
+		cfg.RotationTimeoutSec = 45
 	}
 	currentConfig.Store(cfg)
 	store = newStateStore(cfg.StateFile)
@@ -275,9 +297,13 @@ func pluginRegistration() registration {
 			GitHubRepository: "https://github.com/lij768423-svg/grok2api-egress-enhancements",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "state_file", Type: pluginapi.ConfigFieldTypeString, Description: "出口守护状态文件路径（节点/策略/事件）"},
+				{Name: "rotation_url", Type: pluginapi.ConfigFieldTypeString, Description: "可选、受信任的内部换 IP Webhook；仅对 rotatable_node_ids 生效"},
+				{Name: "rotation_token_env", Type: pluginapi.ConfigFieldTypeString, Description: "从 CPA 进程环境变量读取 Webhook Bearer Token，避免写入配置"},
+				{Name: "rotation_timeout_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "换 IP Webhook 超时（秒）"},
+				{Name: "rotatable_node_ids", Type: pluginapi.ConfigFieldTypeArray, Description: "允许自动换 IP 的节点 ID；留空时禁止自动换 IP"},
 			},
 		},
-		Capabilities: registrationCapabilities{ManagementAPI: true, UsagePlugin: true},
+		Capabilities: registrationCapabilities{ManagementAPI: true, UsagePlugin: true, Scheduler: true, RequestInterceptor: true},
 	}
 }
 
@@ -368,20 +394,14 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			p.ConsecutiveSoft = intPick(raw, p.ConsecutiveSoft, "consecutive_soft", "consecutiveSoft")
 			p.ConsecutiveErrors = intPick(raw, p.ConsecutiveErrors, "consecutive_errors", "consecutiveErrors")
 			p.MinHealthyNodes = intPick(raw, p.MinHealthyNodes, "min_healthy_nodes", "minHealthyNodes")
+			p.MinGenerationMs = int64(intPick(raw, int(p.MinGenerationMs), "min_generation_ms", "minGenerationMs"))
+			p.MinOutputTokens = int64(intPick(raw, int(p.MinOutputTokens), "min_output_tokens", "minOutputTokens"))
+			p.MaxOutputTokensProbe = intPick(raw, p.MaxOutputTokensProbe, "max_output_tokens", "maxOutputTokens")
 			if v, ok := raw["model"].(string); ok && v != "" {
 				p.Model = v
 			}
-			if v, ok := raw["http_429_account_action"].(string); ok {
-				p.HTTP429AccountAction = v
-			}
-			if v, ok := raw["http429AccountAction"].(string); ok {
-				p.HTTP429AccountAction = v
-			}
-			if v, ok := raw["non_429_isolation_action"].(string); ok {
-				p.Non429IsolationAction = v
-			}
-			if v, ok := raw["non429IsolationAction"].(string); ok {
-				p.Non429IsolationAction = v
+			if v, ok := raw["disable_auth_on_hard"].(bool); ok {
+				p.DisableAuthOnHard = v
 			}
 			if err := store.updatePolicy(p); err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("invalidPolicy", err.Error()))
@@ -403,7 +423,10 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			var raw map[string]any
 			_ = json.Unmarshal(body, &raw)
 			name, _ := raw["name"].(string)
-			proxies := collectProxyURLs(raw)
+			proxy, _ := raw["proxyURL"].(string)
+			if proxy == "" {
+				proxy, _ = raw["proxy_url"].(string)
+			}
 			enabled := true
 			if v, ok := raw["enabled"].(bool); ok {
 				enabled = v
@@ -413,18 +436,11 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 				pool, _ = raw["proxy_pool"].(bool)
 			}
 			cap := intPick(raw, 0, "accountCapacity", "account_capacity")
-			items, err := store.createNodes(strings.TrimSpace(name), proxies, enabled, pool, cap)
+			n, err := store.createNode(strings.TrimSpace(name), strings.TrimSpace(proxy), enabled, pool, cap)
 			if err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("createFailed", err.Error()))
 			}
-			out := make([]map[string]any, 0, len(items))
-			for _, n := range items {
-				out = append(out, publicNode(n))
-			}
-			if len(out) == 1 {
-				return managementJSON(http.StatusOK, map[string]any{"data": out[0], "items": out, "created": 1})
-			}
-			return managementJSON(http.StatusOK, map[string]any{"data": map[string]any{"items": out, "total": len(out)}, "items": out, "created": len(out)})
+			return managementJSON(http.StatusOK, map[string]any{"data": publicNode(n)})
 		}
 		if method == http.MethodDelete {
 			var raw map[string]any
@@ -456,6 +472,59 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			return managementJSON(http.StatusOK, map[string]any{"ok": true})
 		}
 
+	case path == "/nodes/import":
+		if method == http.MethodPost {
+			var raw struct {
+				Items []map[string]any `json:"items"`
+			}
+			if err := json.Unmarshal(body, &raw); err != nil {
+				return managementJSON(http.StatusBadRequest, errMsg("invalidBody", "批量节点数据无效"))
+			}
+			if len(raw.Items) == 0 || len(raw.Items) > 500 {
+				return managementJSON(http.StatusBadRequest, errMsg("invalidBody", "单次需导入 1 到 500 个节点"))
+			}
+			inputs := make([]nodeCreateInput, 0, len(raw.Items))
+			for index, item := range raw.Items {
+				name, _ := item["name"].(string)
+				proxy, _ := item["proxyURL"].(string)
+				if proxy == "" {
+					proxy, _ = item["proxy_url"].(string)
+				}
+				if strings.TrimSpace(name) == "" {
+					name = fmt.Sprintf("Node %03d", index+1)
+				}
+				enabled := true
+				if value, ok := item["enabled"].(bool); ok {
+					enabled = value
+				}
+				pool, _ := item["proxyPool"].(bool)
+				if !pool {
+					pool, _ = item["proxy_pool"].(bool)
+				}
+				inputs = append(inputs, nodeCreateInput{
+					Name:            name,
+					ProxyURL:        proxy,
+					Enabled:         enabled,
+					ProxyPool:       pool,
+					AccountCapacity: intPick(item, 0, "accountCapacity", "account_capacity"),
+				})
+			}
+			created, err := store.createNodes(inputs)
+			if err != nil {
+				return managementJSON(http.StatusBadRequest, errMsg("importFailed", err.Error()))
+			}
+			items := make([]map[string]any, 0, len(created))
+			for _, node := range created {
+				items = append(items, publicNode(node))
+			}
+			return managementJSON(http.StatusOK, map[string]any{
+				"ok":      true,
+				"data":    map[string]any{"items": items, "created": len(items)},
+				"items":   items,
+				"created": len(items),
+			})
+		}
+
 	case path == "/nodes/test":
 		if method == http.MethodPost {
 			var raw map[string]any
@@ -480,36 +549,6 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 				return managementJSON(http.StatusBadRequest, errMsg("rebalanceFailed", err.Error()))
 			}
 			return managementJSON(http.StatusOK, map[string]any{"ok": true, "counts": counts})
-		}
-
-	case path == "/nodes/deduplicate-exit-ips":
-		if method == http.MethodPost {
-			var raw map[string]any
-			_ = json.Unmarshal(body, &raw)
-			groups := planExitIPDedup(store.listNodes())
-			duplicates := 0
-			for _, group := range groups {
-				duplicates += len(group.DeleteIDs)
-			}
-			confirm, _ := raw["confirm"].(bool)
-			if !confirm {
-				return managementJSON(http.StatusOK, map[string]any{
-					"ok":                    true,
-					"requires_confirmation": true,
-					"groups":                groups,
-					"duplicate_nodes":       duplicates,
-				})
-			}
-			groups, rebound, err := deduplicateExitIPNodes(store)
-			if err != nil {
-				return managementJSON(http.StatusBadRequest, errMsg("deduplicateFailed", err.Error()))
-			}
-			return managementJSON(http.StatusOK, map[string]any{
-				"ok":               true,
-				"groups":           groups,
-				"deleted":          duplicates,
-				"accounts_rebound": rebound,
-			})
 		}
 
 	case len(parts) == 2 && parts[0] == "nodes" && safeID(parts[1]):
@@ -714,33 +753,6 @@ func stringIDs(v any) []string {
 		out = append(out, t...)
 	}
 	return out
-}
-
-// collectProxyURLs accepts proxyURL / proxy_url as a single string (multi-line OK)
-// and proxyURLs / proxy_urls as a string array. Empty lines are skipped; duplicates
-// are de-duplicated while preserving first-seen order.
-func collectProxyURLs(raw map[string]any) []string {
-	var chunks []string
-	for _, key := range []string{"proxyURLs", "proxy_urls"} {
-		if v, ok := raw[key]; ok {
-			chunks = append(chunks, stringIDs(v)...)
-		}
-	}
-	for _, key := range []string{"proxyURL", "proxy_url"} {
-		if s, ok := raw[key].(string); ok && s != "" {
-			chunks = append(chunks, s)
-		}
-	}
-	var lines []string
-	for _, chunk := range chunks {
-		for _, line := range strings.Split(chunk, "\n") {
-			line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
-			if line != "" {
-				lines = append(lines, line)
-			}
-		}
-	}
-	return uniqueNonEmpty(lines)
 }
 
 func intPick(raw map[string]any, def int, keys ...string) int {

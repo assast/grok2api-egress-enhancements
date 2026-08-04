@@ -8,10 +8,10 @@
 | | |
 |---|---|
 | 插件名 | `grok2api-egress` |
-| 当前版本 | **1.0.5** |
+| 当前版本 | **1.0.7** |
 | 语言 | Go (`-buildmode=c-shared` → `.so`) |
 | CPA SDK | `CLIProxyAPI/v7` (`pluginabi` / `pluginapi`) |
-| 能力 | Management UI + Usage Plugin |
+| 能力 | Management UI + Usage Plugin + Scheduler + Request Interceptor |
 | License | MIT（见仓库根目录 `LICENSE`） |
 
 ---
@@ -27,11 +27,15 @@
 
 - 把出口抽象成 **Node**（存 proxy URL）
 - 把 CPA `xai-*.json` 账号的 `proxy_url` **粘性绑定**到 Node
-- 用 **被动 usage 观测 + 主动 quality probe** 判定 healthy / soft / hard / error
+- 用 **被动 usage 观测 + 主动 quality probe** 判定 healthy / soft / hard / error；账号、额度、上游权限失败只记录为 ignored，不消耗出口错误次数
 - **隔离（quarantine）坏节点**，并 **migrate** 账号到健康通道
+- 调度阶段跳过隔离/冷却账号；选定账号与迁移发生竞态时返回可重试的 `503 + Retry-After: 1`
+- 可选调用受信任的内部换 IP Webhook；只有确认出口 IP 已变化并通过真实模型复测才恢复节点
 - 提供完整 **管理 UI**（节点 CRUD、批量、重平衡、质量测试、策略、事件）
 
 灵感来自 Grok2API 侧的 quality-guard / egress 思路，但实现已完全 native 化，**不需要、也不连接 Grok2API**。
+
+**CPA 本身不会导致模型降智。** 本插件是多账号、多出口场景下的可选熔断器；如果只有单账号或稳定静态代理，没有出口轮换和迁号需求，可以不安装。
 
 ---
 
@@ -74,10 +78,10 @@
 | 能力 | 说明 |
 |---|---|
 | CRUD | 名称、proxy URL、启用、容量、是否参与池 |
+| 批量导入 | 单行代理 URL，或 `名称 | 代理 URL | 容量 | fixed/pool`；最多 500 条、整批原子写入 |
 | 连通性测试 | 经该出口探测外网出口 IP / 延迟 |
 | 质量测试 | 真实 chat 探测，计算 output Token/s |
 | 绑定账号 | 查看粘在该节点 `proxy_url` 上的账号列表 |
-| 剔重出口 IP | 先预览再确认；同一出口 IP 只保留数值最小的节点 ID，并改绑其余节点账号 |
 | 批量启停 / 删除 | 删除前自动解绑 proxy |
 
 ### 账号粘性与调度
@@ -104,22 +108,21 @@
 |---|---|---|
 | healthy | TPS &lt; soft | 保持 |
 | soft | ≥ `soft_tps`（500） | 连续 N 次 → 隔离 |
-| hard | ≥ `hard_tps`（1000） | 立即隔离 |
+| hard | ≥ `hard_tps`（1000）且满足最小 Token 证据 | 立即隔离 |
 | error | 探测失败 | 连续 N 次 → 隔离 |
 
 隔离时：
 
 1. 节点 `quarantined_until = now + quarantine_seconds`
 2. 记事件 `node_quarantined`
-3. **migrate** 账号到健康节点（`accounts_migrated`）
-4. 到期后 probe 通过 → `node_restored`
+3. 同步摘除受影响账号，仅迁移到近期主动检测 healthy 且出口 IP 不同的节点（`accounts_migrated`）
+4. 到期后 probe 通过 → `node_restored`；可选换 IP Webhook 必须先确认新 IP 与旧 IP 不同
 
 保护项：
 
 - `min_healthy_nodes`：低于阈值则 **suppressed**，避免全军覆没
-- `minGenMs = 200`：极短生成窗口不虚高 TPS，降低 loadtest / 短回复误隔离
-- 极小 `output_tokens`（&lt;32）不做 hard 判定
-- 上游 HTTP 429 账号策略：默认冷却命中账号 24 小时；也可改为直接删除。冷却账号只会跳过质量探测，不计入节点质量错误，也不会隔离出口节点。
+- `min_generation_ms = 1000`：极短生成窗口不虚高 TPS，降低 loadtest / 短回复误隔离
+- `min_output_tokens = 32`：证据不足的短输出标记为 ignored，不触发 soft/hard 隔离
 
 ### 管理 UI
 
@@ -130,6 +133,7 @@
 - 节点表：状态徽章、TPS、出口 IP、绑定数、隔离倒计时
 - 行内：连通测试 / 质量测试 / 编辑 / 绑定账号 / 启停
 - 策略表单、事件时间线、一键重平衡
+- 单条添加与逐行批量导入；保存后的代理 URL 不读取、不回显
 
 UI 经 management 代理，请求头需 `X-Grok2API-Egress-UI: 1`（页面已内置）。
 
@@ -138,7 +142,7 @@ UI 经 management 代理，请求头需 `X-Grok2API-Egress-UI: 1`（页面已内
 ## 目录结构
 
 ```text
-egress-guard-native/
+cpa-plugin/
 ├── go/
 │   ├── main.go          # CGO ABI、注册、Management/Usage 入口
 │   ├── store.go         # state.json 读写、节点/策略/事件
@@ -177,7 +181,45 @@ go build -buildmode=c-shared -o grok2api-egress.so .
 
 ---
 
+## 插件商店搜不到？
+
+CPA 默认只加载**官方源**：
+
+```text
+https://raw.githubusercontent.com/router-for-me/CLIProxyAPI-Plugins-Store/main/registry.json
+```
+
+本插件已提交官方收录 PR（`grok2api-egress`）。**合并前**在 CPA 配置里加第三方源即可搜到并在线安装：
+
+```yaml
+plugins:
+  store-sources:
+    - "https://raw.githubusercontent.com/lij768423-svg/grok2api-egress-enhancements/main/cpa-plugin/registry.json"
+```
+
+重启 CPA 后，在插件商店搜索：
+
+- `grok2api-egress`
+- `Grok Egress`
+- `Egress` / `Grok`
+
+官方源合并后可去掉上面的 `store-sources`（也可保留，无影响）。
+
+手动安装（不走商店）见下方「安装（CPA）」。
+
+---
+
 ## 安装（CPA）
+
+### 插件商店（推荐）
+
+**当前状态**：官方源收录 PR 已开（[CLIProxyAPI-Plugins-Store#65](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store/pull/65)）。合并前请先配置上一节的 `store-sources`，否则默认商店搜不到。
+
+配置源并重启后，在 CPA 管理中心打开插件商店，搜索 **Grok Egress Guard** 或插件 ID `grok2api-egress`，选择与 CPA 主机架构一致的版本安装。发布包提供 `linux/amd64` 和 `linux/arm64`；商店会从 GitHub Release 下载并校验 `checksums.txt`。升级时在同一条目选择新版本即可，状态文件不会随插件二进制覆盖。
+
+也可直接从仓库 [Release](https://github.com/lij768423-svg/grok2api-egress-enhancements/releases) 下载 zip，校验 `checksums.txt` 后按下面的手动方式安装。
+
+### 手动安装
 
 1. 复制插件：
 
@@ -192,11 +234,21 @@ volumes:
   - ./plugin-data/egress-guard:/CLIProxyAPI/plugin-data/egress-guard
 ```
 
-3. 插件配置（CPA 插件 YAML，仅一项）：
+3. 插件配置（CPA 插件 YAML）：
 
 ```yaml
 state_file: /CLIProxyAPI/plugin-data/egress-guard/state.json
+# 可选：仅配置到受信任的内部服务；留空即完全关闭自动换 IP
+rotation_url: http://rotation-service:19099/rotate
+# 令牌只从 CPA 容器环境读取，不写入 YAML 或 state.json
+rotation_token_env: EGRESS_ROTATION_TOKEN
+rotation_timeout_seconds: 45
+# 只允许这些 Node ID 触发自动轮换，留空即禁止
+rotatable_node_ids: ["1", "2"]
 ```
+
+`rotation_url` 需要接受 `POST {"nodeId":"...","oldExitIp":"..."}`，返回
+`{"newExitIp":"..."}`。插件会拒绝空 IP、未变化 IP 和非 2xx 响应，随后仍会使用真实模型探测确认质量；Webhook 成功本身不会解除隔离。
 
 4. 重启 CPA，管理台应出现菜单 **「出口守护」**。
 
@@ -210,6 +262,16 @@ state_file: /CLIProxyAPI/plugin-data/egress-guard/state.json
    - `http://127.0.0.1:7952`
    - `http://127.0.0.1:7953`
    （CPA 若用 host 网络，可直接打本机 sticky 代理端口。）
+
+   多个节点可点 **「批量添加」**，每行使用以下任一格式：
+
+   ```text
+   socks5h://user:pass@host:port
+   美西固定 01 | http://user:pass@host:port | 20 | fixed
+   轮换池 01 | socks5h://user:pass@host:port | 50 | pool
+   ```
+
+   空行以及 `#`、`//` 开头的注释会忽略。任一行无效时整批拒绝，不会留下部分节点；导入完成后 API 和页面都不会回显代理 URL。
 
 2. **连通测试** → 确认 `exit_ip` 各不相同（真正粘在不同出口）。
 
@@ -249,10 +311,10 @@ Content-Type: application/json
 | `/status` | GET | 总览、节点 map、策略、事件、统计 |
 | `/policy` | GET/PUT | 读写守护策略 |
 | `/nodes` | GET/POST/DELETE | 列表 / 创建 / 批量删 |
+| `/nodes/import` | POST | 原子批量创建 1-500 个节点；代理 URL 不回显 |
 | `/nodes/batch` | PATCH | 批量启停 |
 | `/nodes/test` | POST | 批量连通测试 |
 | `/nodes/rebalance` | POST | 账号重平衡 |
-| `/nodes/deduplicate-exit-ips` | POST | 预览或确认剔除重复出口 IP 节点 |
 | `/nodes/{id}` | GET/PUT/DELETE | 单节点 |
 | `/nodes/{id}/test` | POST | 连通测试 |
 | `/nodes/{id}/quality-test` | POST | 质量探测 |
@@ -286,7 +348,7 @@ CPA_LOADTEST_LOG_DIR=/var/log/cpa-loadtest \
 - 短 `max_tokens` 适合打通链路；测真实降智请加大生成量并相应调高 `hard_tps` 判定窗口
 - `NO_PROXY` / 直连 CPA，避免本机 HTTP_PROXY 把管理/业务流量拐走
 
-### 一次实测快照（v1.0.3）
+### 历史实测快照（v1.0.3）
 
 | 项 | 结果 |
 |---|---|
@@ -299,21 +361,36 @@ CPA_LOADTEST_LOG_DIR=/var/log/cpa-loadtest \
 
 ---
 
+## 性能（v1.0.7）
+
+低配机器上若出现 CPA 整体变卡 / CPU 打满，通常不是探测本身，而是旧版热路径对 `host.auth.list` + N 次 `host.auth.get` 的反复全量扫描，以及每条 usage 事件全量 `MarshalIndent` 写 `state.json`。
+
+v1.0.7 起：
+
+- 账号列表 **60s 缓存** + save 后就地 patch（migrate 不再 N 次全量扫）
+- 请求热路径（Scheduler / Intercept / Usage）**只读内存映射**，不再 `host.auth.get`
+- 观测统计 / 事件 / 绑定数 **2s 防抖落盘**；隔离/启停/代理变更仍立即落盘
+- 后台 `refreshAssignedCounts` 从每 30s 降为约每 5 分钟
+- `state.json` 改为 compact JSON
+
+功能语义（粘性 `proxy_url`、隔离迁出、校验写回、主动/被动探测）不变。
+
+---
+
 ## 设计要点（给贡献者）
 
 1. **Auth → Node 映射**
-   以 `proxy_url` 字符串相等为键；Usage 事件里的 auth 标识会经 cache（index / name / email / path）反查。映射失败时 hard 观测可 fallback 到最繁忙启用节点，避免“有 hard 统计却永不隔离”。
+   以 `proxy_url` 字符串相等为键；Usage 事件里的 auth 标识会经 cache（index / id / name / email / path）反查。映射失败的异常只记录诊断事件，不猜测并隔离某个“最繁忙”节点，避免误杀。
 
 2. **Quality probe**
    强制 Grok/xAI 客户端头；节点上多账号轮试，降低单账号 401 误判。
 
 3. **隔离与恢复**
-   quarantine 写状态 → migrate → 后台 worker 到期探测 → restore。
-   已知边界：并发隔离/恢复时曾出现 **UI 显示 healthy 但 `quarantined=true` 粘住**；运维侧可清 state 后 rebalance。欢迎 PR 做状态机收敛（以 `quarantined_until` 为唯一真源，cls 派生）。
+   quarantine 写状态 → 同步摘除账号 → 仅迁移到近期主动检测 healthy 且出口 IP 不同的节点 → 后台 worker 到期探测 → restore。迁移写入后会从 CPA Host API 再读一次，校验 `proxy_url` 与 disabled 状态。
 
 4. **误报控制**
-   - 最短生成窗口 `minGenMs`
-   - 小输出不做 hard
+   - 最短生成窗口 `min_generation_ms`
+   - 小输出标记 ignored，不重置或增加异常 strike
    - `min_healthy_nodes` 抑制
 
 5. **安全**
@@ -345,10 +422,10 @@ CPA_LOADTEST_LOG_DIR=/var/log/cpa-loadtest \
 
 ## 路线图 / 欢迎 PR
 
-- [ ] 修复 sticky-q（healthy 与 quarantined 标志长期不一致）
+- [x] 隔离/恢复状态机、迁移后校验与请求竞态保护
 - [ ] 事件/统计按时间窗滑动，避免历史 5xx 永久污染告警
 - [ ] 节点维度的成功率 SLO 与自动扩缩绑定
-- [ ] CI：`go test` + 多架构 `.so` release
+- [x] CI：`go test` + Linux amd64/arm64 `.so` release
 - [ ] 英文 UI / i18n
 - [ ] 补 SPDX License
 

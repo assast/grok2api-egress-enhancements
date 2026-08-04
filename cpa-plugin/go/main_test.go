@@ -2,26 +2,260 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 func TestComputeTPSUsesGenerationWindow(t *testing.T) {
 	// 1050 tokens over 500ms generation window (1100-600) => 2100 TPS
-	if got := computeTPS(1050, 1100, 600); got < 2099 || got > 2101 {
+	if got := computeTPS(1050, 1100, 600, 200); got < 2099 || got > 2101 {
 		t.Fatalf("computeTPS()=%v, want ~2100", got)
 	}
 	// tiny generation window falls back to full duration (avoid false hard)
 	// 100 tokens / 1000ms => 100 TPS
-	if got := computeTPS(100, 1000, 950); got < 99 || got > 101 {
+	if got := computeTPS(100, 1000, 950, 200); got < 99 || got > 101 {
 		t.Fatalf("computeTPS()=%v, want ~100 with min window fallback", got)
 	}
-	if got := computeTPS(100, 0, 0); got != 0 {
+	if got := computeTPS(100, 0, 0, 200); got != 0 {
 		t.Fatalf("computeTPS()=%v, want 0", got)
+	}
+}
+
+func TestFailureClassificationDoesNotTreatAuthErrorsAsTransport(t *testing.T) {
+	for _, test := range []struct {
+		status int
+		body   string
+		kind   string
+	}{
+		{401, "invalid or expired token", "account_error"},
+		{429, "rate limit", "account_error"},
+		{0, "dial tcp 10.0.0.1: i/o timeout", "transport_error"},
+		{503, "upstream unavailable", "upstream_error"},
+	} {
+		if got := classifyFailureKind(test.status, test.body); got != test.kind {
+			t.Fatalf("classifyFailureKind(%d, %q)=%q, want %q", test.status, test.body, got, test.kind)
+		}
+	}
+}
+
+func TestXAITokenAccountingDoesNotDoubleCountReasoning(t *testing.T) {
+	if got := maxInt64(180, 75); got != 180 {
+		t.Fatalf("max token total=%d, want 180", got)
+	}
+	if got := outputTokensFromUsage(map[string]any{
+		"completion_tokens": 180,
+		"output_tokens":     180,
+		"reasoning_tokens":  75,
+	}); got != 180 {
+		t.Fatalf("authoritative token total=%d, want 180", got)
+	}
+}
+
+func TestSmallOutputIsIgnoredBeforeTPSThreshold(t *testing.T) {
+	pol := defaultPolicy()
+	if got := classifyQuality(5000, pol.MinOutputTokens-1, pol); got != "ignored" {
+		t.Fatalf("small output classification=%q, want ignored", got)
+	}
+	if got := classifyQuality(5000, pol.MinOutputTokens, pol); got != "hard" {
+		t.Fatalf("threshold output classification=%q, want hard", got)
+	}
+}
+
+func TestManualDisabledAuthIsNotRestored(t *testing.T) {
+	if isGuardDisabledAuth(authFile{Disabled: true, Raw: map[string]any{"disabled_reason": "operator: maintenance"}}) {
+		t.Fatal("operator-disabled auth must not be treated as guard-managed")
+	}
+}
+
+func TestSchedulerSkipsCoolingStatuses(t *testing.T) {
+	for _, status := range []string{"disabled", "unavailable", "error", "cooling", "pending", "refreshing", "future-state"} {
+		if schedulerCandidateAvailable(pluginapi.SchedulerAuthCandidate{Status: status}) {
+			t.Fatalf("status %q should not be selected", status)
+		}
+	}
+	for _, status := range []string{"", "active", "ready"} {
+		if !schedulerCandidateAvailable(pluginapi.SchedulerAuthCandidate{Status: status}) {
+			t.Fatalf("status %q should be selectable", status)
+		}
+	}
+}
+
+func TestMigrationFailsClosedAndVerifiesHostAuthSave(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	bad, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := store.createNode("good", "http://127.0.0.1:7952", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(good.ID, func(node *nodeRecord) error {
+		node.LastClassification = "healthy"
+		node.LastProbeAt = float64(time.Now().Unix())
+		node.ExitIP = "198.51.100.2"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(bad.ID, func(node *nodeRecord) error {
+		node.ExitIP = "198.51.100.1"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	auths := map[string]map[string]any{
+		"bad.json": {
+			"type": "xai", "email": "bad@example.test", "access_token": "bad-token", "proxy_url": bad.ProxyURL, "disabled": false,
+		},
+		"good.json": {
+			"type": "xai", "email": "good@example.test", "access_token": "good-token", "proxy_url": good.ProxyURL, "disabled": false,
+		},
+		"manual.json": {
+			"type": "xai", "email": "manual@example.test", "access_token": "manual-token", "proxy_url": bad.ProxyURL, "disabled": true, "disabled_reason": "operator maintenance",
+		},
+	}
+	originalHostCall := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			entries := make([]pluginapi.HostAuthFileEntry, 0, len(auths))
+			for name, raw := range auths {
+				disabled, _ := raw["disabled"].(bool)
+				entries = append(entries, pluginapi.HostAuthFileEntry{ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai", Disabled: disabled})
+			}
+			return json.Marshal(hostAuthListResponse{Files: entries})
+		case pluginabi.MethodHostAuthGet:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			name := request["auth_index"]
+			if name == "" {
+				name = request["name"]
+			}
+			raw, ok := auths[name]
+			if !ok {
+				return nil, fmt.Errorf("auth not found: %s", name)
+			}
+			body, _ := json.Marshal(raw)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: name, Name: name, Path: "/auths/" + name, JSON: body})
+		case pluginabi.MethodHostAuthSave:
+			var request struct {
+				Name string          `json:"name"`
+				JSON json.RawMessage `json:"json"`
+			}
+			if err := json.Unmarshal(payload, &request); err != nil {
+				return nil, err
+			}
+			updated := map[string]any{}
+			if err := json.Unmarshal(request.JSON, &updated); err != nil {
+				return nil, err
+			}
+			auths[request.Name] = updated
+			return json.Marshal(pluginapi.HostAuthSaveResponse{Name: request.Name, Path: "/auths/" + request.Name})
+		default:
+			return nil, fmt.Errorf("unexpected host callback %s", method)
+		}
+	}
+	defer func() {
+		hostCall = originalHostCall
+		authProxyMu.Lock()
+		authProxyCache = nil
+		authProxyAt = time.Time{}
+		authProxyMu.Unlock()
+		invalidateAuthListCache()
+	}()
+
+	if err := migrateAuthsOffNode(store, bad); err != nil {
+		t.Fatalf("migrateAuthsOffNode() error = %v", err)
+	}
+	if got := auths["bad.json"]["proxy_url"]; got != good.ProxyURL {
+		t.Fatalf("bad auth proxy=%q, want healthy proxy", got)
+	}
+	if disabled, _ := auths["bad.json"]["disabled"].(bool); disabled {
+		t.Fatal("migrated auth remains disabled")
+	}
+	if got := auths["manual.json"]["proxy_url"]; got != bad.ProxyURL {
+		t.Fatalf("manual auth proxy=%q, want unchanged bad proxy", got)
+	}
+	if disabled, _ := auths["manual.json"]["disabled"].(bool); !disabled {
+		t.Fatal("manual disabled auth was re-enabled")
+	}
+}
+
+func TestSchedulerSkipsQuarantinedNode(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	bad, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := store.createNode("good", "http://127.0.0.1:7952", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(bad.ID, func(node *nodeRecord) error { node.DisabledByGuard = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	authProxyMu.Lock()
+	authProxyCache = map[string]string{"auth-bad": bad.ProxyURL, "auth-good": good.ProxyURL}
+	authProxyAt = time.Now()
+	authProxyMu.Unlock()
+	rawRequest, _ := json.Marshal(pluginapi.SchedulerPickRequest{
+		Provider: "xai",
+		Candidates: []pluginapi.SchedulerAuthCandidate{
+			{ID: "auth-bad", Provider: "xai"},
+			{ID: "auth-good", Provider: "xai"},
+		},
+	})
+	raw, err := handleSchedulerPick(rawRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
+		t.Fatalf("scheduler envelope=%s err=%v", raw, err)
+	}
+	var response pluginapi.SchedulerPickResponse
+	if err := json.Unmarshal(env.Result, &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Handled || response.AuthID != "auth-good" {
+		t.Fatalf("scheduler response=%+v", response)
+	}
+}
+
+func TestRequestInterceptorRejectsQuarantinedAuth(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(node.ID, func(value *nodeRecord) error { value.DisabledByGuard = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	authProxyMu.Lock()
+	authProxyCache = map[string]string{"auth-bad": node.ProxyURL}
+	authProxyAt = time.Now()
+	authProxyMu.Unlock()
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{Metadata: map[string]any{"selected_auth_id": "auth-bad"}})
+	raw, err := handleRequestIntercept(rawRequest, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(raw, &env)
+	var response pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &response)
+	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("interceptor response=%+v", response)
 	}
 }
 
@@ -34,195 +268,6 @@ func TestClassifyTPS(t *testing.T) {
 	}
 	if classifyTPS(100, 500, 1000) != "healthy" {
 		t.Fatal("expected healthy")
-	}
-}
-
-func TestHTTP429AccountActionDefaultsToCooldown(t *testing.T) {
-	if got := defaultPolicy().HTTP429AccountAction; got != http429AccountActionCooldown24 {
-		t.Fatalf("default HTTP 429 action = %q, want %q", got, http429AccountActionCooldown24)
-	}
-	if !isAccountRateLimited(http.StatusTooManyRequests) {
-		t.Fatal("HTTP 429 must use the account handling policy")
-	}
-	if isAccountRateLimited(http.StatusBadGateway) {
-		t.Fatal("non-429 response must not use the account handling policy")
-	}
-}
-
-
-func TestNon429IsolationActionDefaultsAndValidation(t *testing.T) {
-	if got := defaultPolicy().Non429IsolationAction; got != non429IsolationIsolateOnly {
-		t.Fatalf("default non429 action = %q, want %q", got, non429IsolationIsolateOnly)
-	}
-	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
-	p := s.policy()
-	p.Non429IsolationAction = "not-a-real-action"
-	if err := s.updatePolicy(p); err == nil {
-		t.Fatal("invalid non429 action must be rejected")
-	}
-	p = s.policy()
-	p.Non429IsolationAction = non429IsolationDeleteOnly
-	if err := s.updatePolicy(p); err != nil {
-		t.Fatal(err)
-	}
-	if s.policy().Non429IsolationAction != non429IsolationDeleteOnly {
-		t.Fatalf("got %q", s.policy().Non429IsolationAction)
-	}
-}
-
-func TestNon429IsolationActionLegacyLoad(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
-	// Old state without non_429_isolation_action, with disable_auth_on_hard noise
-	raw := `{
-  "version": 1,
-  "policy": {
-    "mode": "hybrid",
-    "soft_tps": 500,
-    "hard_tps": 1000,
-    "disable_auth_on_hard": true,
-    "http_429_account_action": "cooldown_24h"
-  },
-  "nodes": {},
-  "next_id": 1
-}`
-	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	s := newStateStore(path)
-	if got := s.policy().Non429IsolationAction; got != non429IsolationIsolateOnly {
-		t.Fatalf("legacy load Non429IsolationAction = %q, want isolate_only", got)
-	}
-}
-
-func TestDeleteAccountOnlyDoesNotQuarantine(t *testing.T) {
-	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
-	p := s.policy()
-	p.Non429IsolationAction = non429IsolationDeleteOnly
-	p.MinHealthyNodes = 1
-	if err := s.updatePolicy(p); err != nil {
-		t.Fatal(err)
-	}
-	// two nodes so isolate path would also be allowed; we assert delete_only never isolates
-	n1, err := s.createNode("a", "http://127.0.0.1:1", true, false, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.createNode("b", "http://127.0.0.1:2", true, false, 0); err != nil {
-		t.Fatal(err)
-	}
-	res := qualityResult{
-		Classification: "hard",
-		TPS:            2000,
-		OutputTokens:   100,
-		DurationMs:     50,
-		HitAuth:        authFile{Name: "xai-hit.json"},
-		HasHit:         false, // no real file → skip delete, still must not quarantine
-	}
-	applyObservation(s, n1.ID, "active", res)
-	updated, ok := s.getNode(n1.ID)
-	if !ok || updated.DisabledByGuard {
-		t.Fatalf("delete_account_only must not quarantine node: %#v", updated)
-	}
-	evs := s.events()
-	foundSkip := false
-	for _, e := range evs {
-		if e.Event == "account_delete_skipped" {
-			foundSkip = true
-		}
-		if e.Event == "node_quarantined" {
-			t.Fatalf("unexpected quarantine event: %#v", e)
-		}
-	}
-	if !foundSkip {
-		t.Fatal("expected account_delete_skipped when no hit auth")
-	}
-}
-
-func TestIsolateOnlyQuarantinesOnHard(t *testing.T) {
-	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
-	p := s.policy()
-	p.Non429IsolationAction = non429IsolationIsolateOnly
-	p.MinHealthyNodes = 1
-	if err := s.updatePolicy(p); err != nil {
-		t.Fatal(err)
-	}
-	n1, err := s.createNode("a", "http://127.0.0.1:1", true, false, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.createNode("b", "http://127.0.0.1:2", true, false, 0); err != nil {
-		t.Fatal(err)
-	}
-	res := qualityResult{
-		Classification: "hard",
-		TPS:            2000,
-		OutputTokens:   100,
-		DurationMs:     50,
-		HitAuth:        authFile{Name: "xai-hit.json"},
-		HasHit:         true,
-	}
-	applyObservation(s, n1.ID, "active", res)
-	updated, ok := s.getNode(n1.ID)
-	if !ok || !updated.DisabledByGuard {
-		t.Fatalf("isolate_only must quarantine on hard: %#v", updated)
-	}
-	found := false
-	for _, e := range s.events() {
-		if e.Event == "node_quarantined" && e.AuthID == "xai-hit.json" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("quarantine event must include hit auth, events=%#v", s.events())
-	}
-}
-
-func TestExitIPDedupPlanKeepsSmallestNodeID(t *testing.T) {
-	nodes := []*nodeRecord{
-		{ID: "12", Name: "later", ExitIP: "203.0.113.9"},
-		{ID: "2", Name: "first", ExitIP: "203.0.113.9"},
-		{ID: "7", Name: "unique", ExitIP: "203.0.113.10"},
-		{ID: "9", Name: "unknown"},
-	}
-	groups := planExitIPDedup(nodes)
-	if len(groups) != 1 {
-		t.Fatalf("groups = %#v, want one duplicate group", groups)
-	}
-	if groups[0].ExitIP != "203.0.113.9" || groups[0].KeepID != "2" || len(groups[0].DeleteIDs) != 1 || groups[0].DeleteIDs[0] != "12" {
-		t.Fatalf("unexpected dedup plan %#v", groups[0])
-	}
-}
-
-func TestAccountCooldownSurvivesReload(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	s := newStateStore(path)
-	auth := authFile{Name: "xai-limited.json"}
-	if _, err := s.coolAccountFor(auth, time.Hour); err != nil {
-		t.Fatal(err)
-	}
-	if !s.isAccountCooling(auth, time.Now()) {
-		t.Fatal("account must be skipped while its 429 cooldown is active")
-	}
-	if !newStateStore(path).isAccountCooling(auth, time.Now()) {
-		t.Fatal("account cooldown must survive plugin restart")
-	}
-}
-
-func TestAccountLimitedResultDoesNotAffectNodeQuality(t *testing.T) {
-	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
-	node, err := s.createNode("channel", "http://127.0.0.1:1", true, false, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	applyObservation(s, node.ID, "active", qualityResult{Classification: "account_limited", Error: "账号已冷却", HitAuth: authFile{Name: "xai-limited.json"}, HasHit: true})
-	updated, ok := s.getNode(node.ID)
-	if !ok || updated.ErrorStrikes != 0 || updated.DisabledByGuard {
-		t.Fatalf("429 account handling changed node state: %#v", updated)
-	}
-	stats := s.stats()
-	if stats.Active.Total != 1 || stats.Active.Errors != 0 {
-		t.Fatalf("unexpected active statistics: %#v", stats.Active)
 	}
 }
 
@@ -260,56 +305,35 @@ func TestStoreNodeCRUD(t *testing.T) {
 	}
 }
 
-func TestCreateNodesBatch(t *testing.T) {
+func TestStoreCreateNodesIsAllOrNothing(t *testing.T) {
 	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
-	items, err := s.createNodes("pool", []string{
-		"socks5h://u:p@1.example:1080",
-		"",
-		"socks5h://u:p@2.example:1080",
-		"socks5h://u:p@1.example:1080", // duplicate ignored
-		"socks5h://u:p@3.example:1080",
-	}, true, false, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(items) != 3 {
-		t.Fatalf("len=%d want 3", len(items))
-	}
-	if items[0].Name != "pool-01" || items[1].Name != "pool-02" || items[2].Name != "pool-03" {
-		t.Fatalf("names %#v", []string{items[0].Name, items[1].Name, items[2].Name})
-	}
-	if items[0].ProxyURL != "socks5h://u:p@1.example:1080" {
-		t.Fatalf("proxy %q", items[0].ProxyURL)
-	}
-}
-
-func TestCollectProxyURLs(t *testing.T) {
-	got := collectProxyURLs(map[string]any{
-		"proxyURL":  "socks5h://a\n\nsocks5h://b\r\nsocks5h://a",
-		"proxyURLs": []any{"socks5h://c", "  socks5h://b  "},
+	created, err := s.createNodes([]nodeCreateInput{
+		{Name: "a", ProxyURL: "http://127.0.0.1:7951", Enabled: true, AccountCapacity: 100},
+		{Name: "b", ProxyURL: "http://127.0.0.1:7952", Enabled: true, ProxyPool: true, AccountCapacity: 120},
 	})
-	want := []string{"socks5h://c", "socks5h://b", "socks5h://a"}
-	// uniqueNonEmpty preserves first-seen: proxyURLs first, then proxyURL lines
-	if len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
-		t.Fatalf("got %#v want %#v", got, want)
+	if err != nil || len(created) != 2 || len(s.listNodes()) != 2 {
+		t.Fatalf("created=%d nodes=%d err=%v", len(created), len(s.listNodes()), err)
+	}
+	if _, err := s.createNodes([]nodeCreateInput{
+		{Name: "valid", ProxyURL: "http://127.0.0.1:7953", Enabled: true},
+		{Name: "invalid", ProxyURL: "", Enabled: true},
+	}); err == nil {
+		t.Fatal("expected invalid import to fail")
+	}
+	if len(s.listNodes()) != 2 {
+		t.Fatal("invalid batch must not create partial nodes")
 	}
 }
 
 func TestRenderStatusPage(t *testing.T) {
 	page := strings.Replace(pageTemplate, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
-	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "剔重出口 IP", "policy-429-account-action", "policy-non429-isolation-action", "non429IsolationAction", "X-Grok2API-Egress-UI", "一行一个", "proxyURLs"} {
+	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "批量添加", "/nodes/import", "页面每 15 秒刷新", "最短生成窗口", "X-Grok2API-Egress-UI"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("missing %q", want)
 		}
 	}
 	if strings.Contains(page, "/*__HALLMARK_TOKENS__*/") {
 		t.Fatal("tokens not replaced in test helper path only")
-	}
-	if !strings.Contains(page, "minHealthyNodes:Number($('policy-min-healthy').value),http429AccountAction") {
-		t.Fatal("policy save script must close the min healthy node Number call before the 429 action")
-	}
-	if !strings.Contains(page, "non429IsolationAction:$('policy-non429-isolation-action').value") {
-		t.Fatal("policy save script must include non429IsolationAction")
 	}
 }
 
@@ -347,75 +371,153 @@ func TestDispatchNodesList(t *testing.T) {
 	}
 }
 
-
-func TestProxyHostLabel(t *testing.T) {
-	cases := []struct {
-		proxy string
-		want  string
-	}{
-		{"http://proxy.example.com", "proxy.example.com"},
-		{"socks5h://user:pass@1.2.3.4:1080", "1.2.3.4-1080"},
-		{"http://proxy.example.com:8080", "proxy.example.com-8080"},
-		{"", ""},
-		{"not-a-url", ""},
-	}
-	for _, c := range cases {
-		if got := proxyHostLabel(c.proxy); got != c.want {
-			t.Fatalf("proxyHostLabel(%q)=%q want %q", c.proxy, got, c.want)
-		}
-	}
-}
-
-func TestAutoNodeNameFromAuth(t *testing.T) {
-	if got := autoNodeNameFromAuth(authFile{}, "socks5h://u@10.0.0.1:1080"); got != "auto-10.0.0.1-1080" {
-		t.Fatalf("got %q", got)
-	}
-	if got := autoNodeNameFromAuth(authFile{Email: "a@b.com", Name: "xai-a@b.com.json"}, "bad"); got != "auto-a@b.com" {
-		t.Fatalf("email fallback got %q", got)
-	}
-	if got := autoNodeNameFromAuth(authFile{Name: "xai-user.json"}, ""); got != "auto-user" {
-		t.Fatalf("name fallback got %q", got)
-	}
-}
-
-func TestGetNodeByProxy(t *testing.T) {
-	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
-	n, err := s.createNode("ch", "http://127.0.0.1:9001", true, false, 0)
+func TestDispatchNodesImportRedactsProxyURLs(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
+	headers := make(http.Header)
+	headers.Set("X-Grok2API-Egress-UI", "1")
+	requestBody, _ := json.Marshal(map[string]any{
+		"items": []map[string]any{
+			{"name": "fixed-a", "proxyURL": "http://user:pass@127.0.0.1:7951", "accountCapacity": 100},
+			{"proxy_url": "http://user:pass@127.0.0.1:7952", "proxy_pool": true},
+		},
+	})
+	body, _ := json.Marshal(uiProxyRequest{Method: http.MethodPost, Path: "/nodes/import", Body: requestBody})
+	raw, err := handleUIProxy(managementRequest{Method: http.MethodPost, Headers: headers, Body: body})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, ok := s.getNodeByProxy("http://127.0.0.1:9001")
-	if !ok || got.ID != n.ID {
-		t.Fatalf("getNodeByProxy ok=%v id=%v want %s", ok, got, n.ID)
+	var env envelope
+	_ = json.Unmarshal(raw, &env)
+	var resp managementResponse
+	_ = json.Unmarshal(env.Result, &resp)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(resp.Body), `"created":2`) {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, resp.Body)
 	}
-	if _, ok := s.getNodeByProxy("http://missing"); ok {
-		t.Fatal("missing proxy should not match")
+	if strings.Contains(string(resp.Body), "user:pass") || strings.Contains(string(resp.Body), "proxy_url") {
+		t.Fatalf("response leaked proxy URL: %s", resp.Body)
 	}
-	if _, ok := s.getNodeByProxy(""); ok {
-		t.Fatal("empty proxy should not match")
+	if len(store.listNodes()) != 2 {
+		t.Fatalf("node count=%d", len(store.listNodes()))
 	}
 }
 
-func TestEnsureNodeFromAuthProxyCreatesOnce(t *testing.T) {
-	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
-	auth := authFile{
-		Name:     "xai-alessandrolomison9918005-leave@hotmail.com.json",
-		Email:    "alessandrolomison9918005-leave@hotmail.com",
-		ProxyURL: "socks5h://user:pass@203.0.113.9:1080",
+func TestAuthListCacheAvoidsRepeatedHostGets(t *testing.T) {
+	invalidateAuthListCache()
+	calls := map[string]int{}
+	auths := map[string]map[string]any{
+		"a.json": {"type": "xai", "email": "a@example.test", "access_token": "t", "proxy_url": "http://127.0.0.1:1", "disabled": false},
+		"b.json": {"type": "xai", "email": "b@example.test", "access_token": "t", "proxy_url": "http://127.0.0.1:2", "disabled": false},
 	}
-	id1, created1, err := ensureNodeForAuthProxy(s, auth)
-	if err != nil || !created1 || id1 == "" {
-		t.Fatalf("first ensure err=%v created=%v id=%q", err, created1, id1)
+	original := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		calls[method]++
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			entries := make([]pluginapi.HostAuthFileEntry, 0, len(auths))
+			for name, raw := range auths {
+				disabled, _ := raw["disabled"].(bool)
+				entries = append(entries, pluginapi.HostAuthFileEntry{ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai", Disabled: disabled})
+			}
+			return json.Marshal(hostAuthListResponse{Files: entries})
+		case pluginabi.MethodHostAuthGet:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			name := request["auth_index"]
+			if name == "" {
+				name = request["name"]
+			}
+			raw, ok := auths[name]
+			if !ok {
+				return nil, fmt.Errorf("missing %s", name)
+			}
+			body, _ := json.Marshal(raw)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: name, Name: name, Path: "/auths/" + name, JSON: body})
+		case pluginabi.MethodHostAuthSave:
+			var request struct {
+				Name string          `json:"name"`
+				JSON json.RawMessage `json:"json"`
+			}
+			if err := json.Unmarshal(payload, &request); err != nil {
+				return nil, err
+			}
+			updated := map[string]any{}
+			if err := json.Unmarshal(request.JSON, &updated); err != nil {
+				return nil, err
+			}
+			auths[request.Name] = updated
+			return json.Marshal(pluginapi.HostAuthSaveResponse{Name: request.Name, Path: "/auths/" + request.Name})
+		default:
+			return nil, fmt.Errorf("unexpected %s", method)
+		}
 	}
-	id2, created2, err := ensureNodeForAuthProxy(s, auth)
-	if err != nil || created2 || id2 != id1 {
-		t.Fatalf("second ensure err=%v created=%v id=%q want id=%q", err, created2, id2, id1)
+	defer func() {
+		hostCall = original
+		invalidateAuthListCache()
+		authProxyMu.Lock()
+		authProxyCache = nil
+		authProxyAt = time.Time{}
+		authProxyMu.Unlock()
+	}()
+
+	first, err := listAuthFiles()
+	if err != nil || len(first) != 2 {
+		t.Fatalf("first list: n=%d err=%v", len(first), err)
 	}
-	n, ok := s.getNode(id1)
-	if !ok || n.ProxyURL != auth.ProxyURL {
-		t.Fatalf("node missing or proxy mismatch: %#v", n)
+	if calls[pluginabi.MethodHostAuthList] != 1 || calls[pluginabi.MethodHostAuthGet] != 2 {
+		t.Fatalf("cold list host calls list=%d get=%d, want 1/2", calls[pluginabi.MethodHostAuthList], calls[pluginabi.MethodHostAuthGet])
 	}
-	if !strings.HasPrefix(n.Name, "auto-") {
-		t.Fatalf("auto name = %q", n.Name)
+	for i := 0; i < 5; i++ {
+		if _, err := listAuthFiles(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls[pluginabi.MethodHostAuthList] != 1 || calls[pluginabi.MethodHostAuthGet] != 2 {
+		t.Fatalf("warm path re-hit host: list=%d get=%d", calls[pluginabi.MethodHostAuthList], calls[pluginabi.MethodHostAuthGet])
+	}
+	if err := saveAuthFile("a.json", map[string]any{
+		"type": "xai", "email": "a@example.test", "access_token": "t", "proxy_url": "http://127.0.0.1:9", "disabled": false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// patched cache must reflect new proxy without another full list/get sweep
+	got, err := listAuthFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, a := range got {
+		if a.Name == "a.json" && a.ProxyURL == "http://127.0.0.1:9" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("cache was not patched after save")
+	}
+	if calls[pluginabi.MethodHostAuthList] != 1 || calls[pluginabi.MethodHostAuthGet] != 2 {
+		t.Fatalf("save+list triggered refetch list=%d get=%d", calls[pluginabi.MethodHostAuthList], calls[pluginabi.MethodHostAuthGet])
+	}
+}
+
+func TestDebouncedPersistCoalescesStats(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	s := newStateStore(path)
+	s.flushDelay = 50 * time.Millisecond
+	for i := 0; i < 20; i++ {
+		s.bumpStat("passive", "healthy", 10)
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st guardState
+	if err := json.Unmarshal(raw, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Stats.Passive.Total != 20 {
+		t.Fatalf("passive total=%d want 20", st.Stats.Passive.Total)
 	}
 }

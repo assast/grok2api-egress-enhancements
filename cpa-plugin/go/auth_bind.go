@@ -3,9 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -24,6 +24,7 @@ type hostAuthGetResponse struct {
 }
 
 type authFile struct {
+	ID       string
 	Index    string
 	Name     string
 	Path     string
@@ -33,8 +34,81 @@ type authFile struct {
 	Raw      map[string]any
 }
 
+// auth list cache: avoids the host.auth.list + N×host.auth.get stampede on
+// every scheduler / usage / worker tick. Mutations patch the cache in place;
+// a 60s TTL still picks up external CPA auth changes.
+const authListCacheTTL = 60 * time.Second
+
+var (
+	authListMu      sync.Mutex
+	authListCache   []authFile
+	authListAt      time.Time
+	authListLoading bool
+	authListWait    = sync.NewCond(&authListMu)
+)
+
+func invalidateAuthListCache() {
+	authListMu.Lock()
+	authListCache = nil
+	authListAt = time.Time{}
+	authListMu.Unlock()
+}
+
+func cloneAuthFiles(in []authFile) []authFile {
+	if in == nil {
+		return nil
+	}
+	out := make([]authFile, len(in))
+	copy(out, in)
+	return out
+}
+
+// listAuthFiles returns xAI auth files, preferring a warm cache.
 func listAuthFiles() ([]authFile, error) {
-	raw, err := callHost(pluginabi.MethodHostAuthList, mustJSON(map[string]any{}))
+	return listAuthFilesCached(false)
+}
+
+// listAuthFilesFresh bypasses TTL (management UI, rebalance entry).
+func listAuthFilesFresh() ([]authFile, error) {
+	return listAuthFilesCached(true)
+}
+
+func listAuthFilesCached(force bool) ([]authFile, error) {
+	authListMu.Lock()
+	for authListLoading {
+		authListWait.Wait()
+	}
+	if !force && authListCache != nil && time.Since(authListAt) < authListCacheTTL {
+		out := cloneAuthFiles(authListCache)
+		authListMu.Unlock()
+		return out, nil
+	}
+	authListLoading = true
+	authListMu.Unlock()
+
+	loaded, err := fetchAuthFilesFromHost()
+
+	authListMu.Lock()
+	authListLoading = false
+	if err == nil {
+		authListCache = loaded
+		authListAt = time.Now()
+	}
+	out := cloneAuthFiles(authListCache)
+	authListWait.Broadcast()
+	authListMu.Unlock()
+	if err != nil {
+		if out != nil {
+			// serve stale on transient host errors to keep hot path alive
+			return out, nil
+		}
+		return nil, err
+	}
+	return out, nil
+}
+
+func fetchAuthFilesFromHost() ([]authFile, error) {
+	raw, err := hostCall(pluginabi.MethodHostAuthList, mustJSON(map[string]any{}))
 	if err != nil {
 		return nil, err
 	}
@@ -79,16 +153,48 @@ func listAuthFiles() ([]authFile, error) {
 				continue
 			}
 		}
+		got.ID = strings.TrimSpace(f.ID)
 		out = append(out, got)
 	}
 	return out, nil
 }
 
+// patchAuthListCacheAfterSave updates one entry after host.auth.save so migrate
+// of hundreds of accounts does not re-trigger N+1 list/get.
+func patchAuthListCacheAfterSave(name string, obj map[string]any) {
+	if name == "" || obj == nil {
+		return
+	}
+	proxy, _ := obj["proxy_url"].(string)
+	proxy = strings.TrimSpace(proxy)
+	disabled, _ := obj["disabled"].(bool)
+	email, _ := obj["email"].(string)
+
+	authListMu.Lock()
+	defer authListMu.Unlock()
+	if authListCache == nil {
+		return
+	}
+	for i := range authListCache {
+		a := &authListCache[i]
+		if a.Name != name && a.Index != name && a.ID != name {
+			continue
+		}
+		a.ProxyURL = proxy
+		a.Disabled = disabled
+		a.Raw = obj
+		if email != "" {
+			a.Email = email
+		}
+		return
+	}
+}
+
 func getAuthFile(authIndex string) (authFile, error) {
-	raw, err := callHost(pluginabi.MethodHostAuthGet, mustJSON(map[string]any{"auth_index": authIndex}))
+	raw, err := hostCall(pluginabi.MethodHostAuthGet, mustJSON(map[string]any{"auth_index": authIndex}))
 	if err != nil {
 		// try name field
-		raw, err = callHost(pluginabi.MethodHostAuthGet, mustJSON(map[string]any{"name": authIndex}))
+		raw, err = hostCall(pluginabi.MethodHostAuthGet, mustJSON(map[string]any{"name": authIndex}))
 		if err != nil {
 			return authFile{}, err
 		}
@@ -134,10 +240,15 @@ func saveAuthFile(name string, obj map[string]any) error {
 	if err != nil {
 		return err
 	}
-	_, err = callHost(pluginabi.MethodHostAuthSave, mustJSON(map[string]any{
+	_, err = hostCall(pluginabi.MethodHostAuthSave, mustJSON(map[string]any{
 		"name": name,
 		"json": json.RawMessage(raw),
 	}))
+	if err == nil {
+		patchAuthListCacheAfterSave(name, obj)
+		// Rebuild proxy map from the patched list cache (no host round-trips).
+		invalidateAuthProxyCache()
+	}
 	return err
 }
 
@@ -165,40 +276,52 @@ func setAuthProxyAndFlags(a authFile, proxyURL string, disabled bool, reason str
 	return saveAuthFile(a.Name, a.Raw)
 }
 
-// deleteAuthFile disables the credential through the host before deleting its
-// physical file. The native host ABI has no delete callback; this guarded path
-// is valid only for file-backed credentials, which is the CPA deployment model.
-func deleteAuthFile(a authFile, reason string) error {
-	name := strings.TrimSpace(a.Name)
-	path := filepath.Clean(strings.TrimSpace(a.Path))
-	if name == "" || filepath.Base(name) != name || !strings.HasSuffix(strings.ToLower(name), ".json") {
-		return fmt.Errorf("账号文件名无效")
+func isGuardDisabledAuth(a authFile) bool {
+	if !a.Disabled {
+		return false
 	}
-	if path == "." || filepath.Base(path) != name {
-		return fmt.Errorf("账号不是可安全删除的本地文件")
+	reason, _ := a.Raw["disabled_reason"].(string)
+	return strings.Contains(reason, "egress-guard") || strings.Contains(reason, "降智")
+}
+
+func verifyAuthBinding(a authFile, expectedProxy string, expectedDisabled bool) error {
+	key := firstNonEmpty(a.Index, a.Name)
+	if key == "" {
+		return fmt.Errorf("账号缺少 auth index")
 	}
-	info, err := os.Lstat(path)
+	got, err := getAuthFile(key)
+	if err == nil && got.ProxyURL == expectedProxy && got.Disabled == expectedDisabled {
+		return nil
+	}
+	// A host may regenerate the runtime auth index after host.auth.save. Verify
+	// by stable name/path with single gets — never re-list the whole auth pool.
+	for _, candidate := range []string{a.Name, filepath.Base(a.Path), a.Index, a.ID} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" || candidate == key {
+			continue
+		}
+		got2, err2 := getAuthFile(candidate)
+		if err2 == nil && got2.ProxyURL == expectedProxy && got2.Disabled == expectedDisabled {
+			return nil
+		}
+	}
 	if err != nil {
-		return fmt.Errorf("读取账号文件失败: %w", err)
+		return fmt.Errorf("读取迁移结果失败: %w", err)
 	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("账号不是常规文件")
+	return fmt.Errorf("迁移结果未生效")
+}
+
+func listAuthFilesBestEffort() []authFile {
+	items, err := listAuthFiles()
+	if err != nil {
+		return nil
 	}
-	if err := setAuthProxyAndFlags(a, a.ProxyURL, true, reason); err != nil {
-		return fmt.Errorf("下线账号失败: %w", err)
-	}
-	if err := os.Remove(path); err != nil {
-		return fmt.Errorf("删除账号文件失败: %w", err)
-	}
-	authProxyMu.Lock()
-	authProxyCache = nil
-	authProxyAt = time.Time{}
-	authProxyMu.Unlock()
-	return nil
+	return items
 }
 
 func rebalanceAuthsToNodes(store *stateStore) (map[string]int, error) {
-	auths, err := listAuthFiles()
+	// Fresh list so operator-driven rebalance sees latest CPA auth files.
+	auths, err := listAuthFilesFresh()
 	if err != nil {
 		return nil, err
 	}
@@ -256,6 +379,9 @@ func rebalanceAuthsToNodes(store *stateStore) (map[string]int, error) {
 		if err := setAuthProxyAndFlags(a, chosen.ProxyURL, false, ""); err != nil {
 			return counts, fmt.Errorf("绑定 %s 失败: %w", a.Name, err)
 		}
+		if err := verifyAuthBinding(a, chosen.ProxyURL, false); err != nil {
+			return counts, fmt.Errorf("绑定 %s 校验失败: %w", a.Name, err)
+		}
 		counts[chosen.ID]++
 	}
 	store.setAssignedCounts(counts)
@@ -293,7 +419,9 @@ func disableAuthsOnNode(store *stateStore, node *nodeRecord, reason string) erro
 	}
 	for _, a := range auths {
 		if a.ProxyURL == node.ProxyURL && !a.Disabled {
-			_ = setAuthProxyAndFlags(a, a.ProxyURL, true, reason)
+			if err := setAuthProxyAndFlags(a, a.ProxyURL, true, reason); err != nil {
+				return fmt.Errorf("停用 %s 失败: %w", a.Name, err)
+			}
 		}
 	}
 	return nil
@@ -310,7 +438,7 @@ func enableAuthsOnNode(node *nodeRecord) error {
 	for _, a := range auths {
 		if a.ProxyURL == node.ProxyURL && a.Disabled {
 			reason, _ := a.Raw["disabled_reason"].(string)
-			if strings.Contains(reason, "egress-guard") || strings.Contains(reason, "降智") || reason == "" {
+			if strings.Contains(reason, "egress-guard") || strings.Contains(reason, "降智") {
 				_ = setAuthProxyAndFlags(a, a.ProxyURL, false, "")
 			}
 		}
@@ -329,9 +457,12 @@ func pickAuthForNode(node *nodeRecord) (authFile, error) {
 	return list[0], nil
 }
 
-// listAuthsForNode returns enabled xAI auths bound to the node proxy, preferring
-// non-expired tokens. A positive limit caps the result; zero returns all candidates.
+// listAuthsForNode returns up to limit enabled xAI auths bound to the node proxy,
+// preferring non-expired tokens. Falls back to any enabled xAI auth if none bound.
 func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
+	if limit <= 0 {
+		limit = 5
+	}
 	auths, err := listAuthFiles()
 	if err != nil {
 		return nil, err
@@ -360,15 +491,15 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 	}
 	out := make([]authFile, 0, limit)
 	out = append(out, primary...)
-	// Prefer proxy-bound accounts. Only if none are bound, fall back to foreign auths
+	// If node has no fresh bound auth, still try expired bound ones before foreign auths
 	// so quality probe still pins to the channel when possible.
 	if len(out) == 0 {
 		out = append(out, expired...)
 	}
-	if len(out) == 0 {
+	if len(out) < limit {
 		out = append(out, fallback...)
 	}
-	if limit > 0 && len(out) > limit {
+	if len(out) > limit {
 		out = out[:limit]
 	}
 	if len(out) == 0 {
@@ -377,95 +508,10 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 	return out, nil
 }
 
-func listProbeAuthsForNode(store *stateStore, node *nodeRecord, limit int) ([]authFile, bool, error) {
-	auths, err := listAuthsForNode(node, 0)
-	if err != nil {
-		return nil, false, err
-	}
-	if limit <= 0 {
-		limit = 8
-	}
-	available := make([]authFile, 0, limit)
-	cooling := false
-	now := time.Now()
-	for _, auth := range auths {
-		if store.isAccountCooling(auth, now) {
-			cooling = true
-			continue
-		}
-		available = append(available, auth)
-		if len(available) == limit {
-			break
-		}
-	}
-	return available, cooling, nil
-}
-
-func rebindAuthsToNode(auths []authFile, sourceProxy string, destination *nodeRecord) (int, error) {
-	if destination == nil || destination.ProxyURL == "" {
-		return 0, fmt.Errorf("保留节点缺少代理")
-	}
-	moved := 0
-	for _, auth := range auths {
-		if auth.ProxyURL != sourceProxy || sourceProxy == destination.ProxyURL {
-			continue
-		}
-		reason, _ := auth.Raw["disabled_reason"].(string)
-		if err := setAuthProxyAndFlags(auth, destination.ProxyURL, auth.Disabled, reason); err != nil {
-			return moved, fmt.Errorf("改绑账号 %s 失败: %w", auth.Name, err)
-		}
-		moved++
-	}
-	return moved, nil
-}
-
-func deduplicateExitIPNodes(store *stateStore) ([]exitIPDedupGroup, int, error) {
-	groups := planExitIPDedup(store.listNodes())
-	if len(groups) == 0 {
-		return groups, 0, nil
-	}
-	auths, err := listAuthFiles()
-	if err != nil {
-		return nil, 0, err
-	}
-	deleteIDs := make([]string, 0)
-	moved := 0
-	for _, group := range groups {
-		keep, ok := store.getNode(group.KeepID)
-		if !ok {
-			return nil, moved, fmt.Errorf("保留节点 %s 不存在", group.KeepID)
-		}
-		for _, deleteID := range group.DeleteIDs {
-			duplicate, ok := store.getNode(deleteID)
-			if !ok {
-				continue
-			}
-			count, err := rebindAuthsToNode(auths, duplicate.ProxyURL, keep)
-			if err != nil {
-				return nil, moved, err
-			}
-			moved += count
-			deleteIDs = append(deleteIDs, deleteID)
-		}
-	}
-	if err := store.deleteNodes(deleteIDs); err != nil {
-		return nil, moved, err
-	}
-	refreshAssignedCounts(store)
-	for _, group := range groups {
-		store.appendEvent(guardEvent{
-			Event:    "exit_ip_deduplicated",
-			NodeID:   group.KeepID,
-			NodeName: "出口 " + group.ExitIP,
-			Reason:   fmt.Sprintf("保留节点 %s，剔除 %d 个重复节点", group.KeepID, len(group.DeleteIDs)),
-		})
-	}
-	return groups, moved, nil
-}
-
 // listBoundAuthSummaries returns lightweight account info for a node (no secrets).
 func listBoundAuthSummaries(node *nodeRecord) ([]map[string]any, error) {
-	auths, err := listAuthFiles()
+	// UI path: prefer fresh data so operators see post-rebalance bindings immediately.
+	auths, err := listAuthFilesFresh()
 	if err != nil {
 		return nil, err
 	}
@@ -487,38 +533,73 @@ func listBoundAuthSummaries(node *nodeRecord) ([]map[string]any, error) {
 	return out, nil
 }
 
-// migrateAuthsOffNode moves enabled auths off a quarantined node onto healthy nodes.
+func verifiedMigrationTargets(store *stateStore, bad *nodeRecord) []*nodeRecord {
+	if store == nil || bad == nil {
+		return nil
+	}
+	pol := store.policy()
+	freshness := time.Duration(pol.ActiveIntervalSec*2) * time.Second
+	if freshness < time.Hour {
+		freshness = time.Hour
+	}
+	cutoff := float64(time.Now().Add(-freshness).Unix())
+	targets := make([]*nodeRecord, 0)
+	for _, n := range store.listNodes() {
+		if n.ID == bad.ID || !n.Enabled || n.DisabledByGuard || n.ProxyURL == "" {
+			continue
+		}
+		if n.LastClassification != "healthy" || n.LastProbeAt <= cutoff || n.ExitIP == "" {
+			continue
+		}
+		if bad.ExitIP != "" && n.ExitIP == bad.ExitIP {
+			continue
+		}
+		targets = append(targets, n)
+	}
+	return targets
+}
+
+// migrateAuthsOffNode fails closed, then moves only guard-managed accounts to
+// recently active-verified nodes with a different observed exit IP.
 func migrateAuthsOffNode(store *stateStore, bad *nodeRecord) error {
 	if bad == nil || bad.ProxyURL == "" {
 		return nil
 	}
-	auths, err := listAuthFiles()
+	// Force a fresh snapshot once; subsequent saves patch the cache in place.
+	auths, err := listAuthFilesFresh()
 	if err != nil {
 		return err
 	}
-	healthy := make([]*nodeRecord, 0)
-	for _, n := range store.listNodes() {
-		if n.ID == bad.ID {
-			continue
-		}
-		if n.Enabled && !n.DisabledByGuard && n.ProxyURL != "" {
-			healthy = append(healthy, n)
+	affected := make([]authFile, 0)
+	for _, a := range auths {
+		if a.ProxyURL == bad.ProxyURL && (!a.Disabled || isGuardDisabledAuth(a)) {
+			affected = append(affected, a)
 		}
 	}
+	if len(affected) == 0 {
+		return nil
+	}
+	// Remove every affected account from scheduling before changing its proxy.
+	for _, a := range affected {
+		if a.Disabled {
+			continue
+		}
+		if err := setAuthProxyAndFlags(a, a.ProxyURL, true, "egress-guard 隔离中"); err != nil {
+			return fmt.Errorf("隔离账号 %s 失败: %w", a.Name, err)
+		}
+	}
+	healthy := verifiedMigrationTargets(store, bad)
 	if len(healthy) == 0 {
-		// no destination — just disable in place
-		return disableAuthsOnNode(store, bad, "egress-guard 降智隔离: 无健康通道可迁移")
+		return fmt.Errorf("没有通过主动检测且出口 IP 不同的健康通道")
 	}
 	cursor := 0
 	moved := 0
-	for _, a := range auths {
-		if a.ProxyURL != bad.ProxyURL {
-			continue
-		}
+	failed := 0
+	for _, a := range affected {
 		dest := healthy[cursor%len(healthy)]
 		cursor++
-		// re-enable if previously guard-disabled, bind to healthy proxy
-		if err := setAuthProxyAndFlags(a, dest.ProxyURL, false, ""); err != nil {
+		if err := setAuthProxyAndFlags(a, dest.ProxyURL, false, ""); err != nil || verifyAuthBinding(a, dest.ProxyURL, false) != nil {
+			failed++
 			continue
 		}
 		moved++
@@ -529,8 +610,11 @@ func migrateAuthsOffNode(store *stateStore, bad *nodeRecord) error {
 			Event:    "accounts_migrated",
 			NodeID:   bad.ID,
 			NodeName: bad.Name,
-			Reason:   fmt.Sprintf("隔离后迁出 %d 个账号到健康通道", moved),
+			Reason:   fmt.Sprintf("隔离后迁出 %d 个账号到健康通道，失败 %d 个", moved, failed),
 		})
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d 个账号迁移或验证失败", failed)
 	}
 	return nil
 }

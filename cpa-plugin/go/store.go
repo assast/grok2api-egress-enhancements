@@ -3,42 +3,30 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-const (
-	http429AccountActionDelete     = "delete_account"
-	http429AccountActionCooldown24 = "cooldown_24h"
-
-	non429IsolationIsolateOnly   = "isolate_only"
-	non429IsolationIsolateDelete = "isolate_and_delete"
-	non429IsolationDeleteOnly    = "delete_account_only"
-)
-
 type policyConfig struct {
-	Mode                   string  `json:"mode"`
-	ActiveIntervalSec      int     `json:"active_interval_seconds"`
-	PassivePollSec         int     `json:"passive_poll_seconds"`
-	QuarantineSec          int     `json:"quarantine_seconds"`
-	SoftTPS                float64 `json:"soft_tps"`
-	HardTPS                float64 `json:"hard_tps"`
-	ConsecutiveSoft        int     `json:"consecutive_soft"`
-	ConsecutiveErrors      int     `json:"consecutive_errors"`
-	MinHealthyNodes        int     `json:"min_healthy_nodes"`
-	Model                  string  `json:"model"`
-	MaxOutputTokensProbe   int     `json:"max_output_tokens"`
-	HTTP429AccountAction   string  `json:"http_429_account_action"`
-	Non429IsolationAction  string  `json:"non_429_isolation_action"`
-}
-
-type accountCooldown struct {
-	Until float64 `json:"until"`
+	Mode                 string  `json:"mode"`
+	ActiveIntervalSec    int     `json:"active_interval_seconds"`
+	PassivePollSec       int     `json:"passive_poll_seconds"`
+	QuarantineSec        int     `json:"quarantine_seconds"`
+	SoftTPS              float64 `json:"soft_tps"`
+	HardTPS              float64 `json:"hard_tps"`
+	ConsecutiveSoft      int     `json:"consecutive_soft"`
+	ConsecutiveErrors    int     `json:"consecutive_errors"`
+	MinHealthyNodes      int     `json:"min_healthy_nodes"`
+	MinGenerationMs      int64   `json:"min_generation_ms"`
+	MinOutputTokens      int64   `json:"min_output_tokens"`
+	Model                string  `json:"model"`
+	DisableAuthOnHard    bool    `json:"disable_auth_on_hard"`
+	MaxOutputTokensProbe int     `json:"max_output_tokens"`
 }
 
 type nodeRecord struct {
@@ -70,6 +58,14 @@ type nodeRecord struct {
 	UpdatedAt            time.Time `json:"updated_at"`
 }
 
+type nodeCreateInput struct {
+	Name            string
+	ProxyURL        string
+	Enabled         bool
+	ProxyPool       bool
+	AccountCapacity int
+}
+
 type guardEvent struct {
 	TS             float64 `json:"ts"`
 	Event          string  `json:"event"`
@@ -87,6 +83,7 @@ type probeStats struct {
 	Soft         int64 `json:"soft"`
 	Hard         int64 `json:"hard"`
 	Errors       int64 `json:"errors"`
+	Ignored      int64 `json:"ignored"`
 	OutputTokens int64 `json:"output_tokens"`
 }
 
@@ -104,59 +101,54 @@ type statistics struct {
 }
 
 type guardState struct {
-	Version          int                        `json:"version"`
-	Policy           policyConfig               `json:"policy"`
-	Nodes            map[string]*nodeRecord     `json:"nodes"`
-	Events           []guardEvent               `json:"events"`
-	Stats            statistics                 `json:"statistics"`
-	AccountCooldowns map[string]accountCooldown `json:"account_cooldowns,omitempty"`
-	NextID           int                        `json:"next_id"`
-	UpdatedAt        float64                    `json:"updated_at"`
+	Version   int                    `json:"version"`
+	Policy    policyConfig           `json:"policy"`
+	Nodes     map[string]*nodeRecord `json:"nodes"`
+	Events    []guardEvent           `json:"events"`
+	Stats     statistics             `json:"statistics"`
+	NextID    int                    `json:"next_id"`
+	UpdatedAt float64                `json:"updated_at"`
 }
 
 type stateStore struct {
-	mu   sync.Mutex
-	path string
-	data guardState
+	mu         sync.Mutex
+	path       string
+	data       guardState
+	dirty      bool
+	flushTimer *time.Timer
+	// flushDelay batches high-frequency observation/event writes so every
+	// usage event does not MarshalIndent+fsync the full state file.
+	flushDelay time.Duration
 }
 
 func defaultPolicy() policyConfig {
 	return policyConfig{
-		Mode:                  "hybrid",
-		ActiveIntervalSec:     1800,
-		PassivePollSec:        5,
-		QuarantineSec:         120,
-		SoftTPS:               500,
-		HardTPS:               1000,
-		ConsecutiveSoft:       2,
-		ConsecutiveErrors:     2,
-		MinHealthyNodes:       1,
-		Model:                 "grok-4.5",
-		MaxOutputTokensProbe:  384,
-		HTTP429AccountAction:  http429AccountActionCooldown24,
-		Non429IsolationAction: non429IsolationIsolateOnly,
-	}
-}
-
-func normalizeNon429IsolationAction(v string) string {
-	switch strings.TrimSpace(v) {
-	case non429IsolationIsolateOnly, non429IsolationIsolateDelete, non429IsolationDeleteOnly:
-		return strings.TrimSpace(v)
-	default:
-		return ""
+		Mode:                 "hybrid",
+		ActiveIntervalSec:    1800,
+		PassivePollSec:       5,
+		QuarantineSec:        120,
+		SoftTPS:              500,
+		HardTPS:              1000,
+		ConsecutiveSoft:      2,
+		ConsecutiveErrors:    2,
+		MinHealthyNodes:      1,
+		MinGenerationMs:      1000,
+		MinOutputTokens:      32,
+		Model:                "grok-4.5",
+		DisableAuthOnHard:    true,
+		MaxOutputTokensProbe: 384,
 	}
 }
 
 func newStateStore(path string) *stateStore {
-	s := &stateStore{path: path}
+	s := &stateStore{path: path, flushDelay: 2 * time.Second}
 	s.data = guardState{
-		Version:          1,
-		Policy:           defaultPolicy(),
-		Nodes:            map[string]*nodeRecord{},
-		Events:           nil,
-		Stats:            statistics{StartedAt: float64(time.Now().Unix())},
-		AccountCooldowns: map[string]accountCooldown{},
-		NextID:           1,
+		Version: 1,
+		Policy:  defaultPolicy(),
+		Nodes:   map[string]*nodeRecord{},
+		Events:  nil,
+		Stats:   statistics{StartedAt: float64(time.Now().Unix())},
+		NextID:  1,
 	}
 	_ = s.load()
 	return s
@@ -179,23 +171,32 @@ func (s *stateStore) load() error {
 	if data.Nodes == nil {
 		data.Nodes = map[string]*nodeRecord{}
 	}
-	if data.AccountCooldowns == nil {
-		data.AccountCooldowns = map[string]accountCooldown{}
-	}
 	if data.NextID <= 0 {
 		data.NextID = 1
 	}
 	if data.Policy.HardTPS <= 0 {
 		data.Policy = defaultPolicy()
 	}
-	if data.Policy.HTTP429AccountAction == "" {
-		data.Policy.HTTP429AccountAction = http429AccountActionDelete
+	if data.Policy.MinGenerationMs <= 0 {
+		data.Policy.MinGenerationMs = 1000
 	}
-	if data.Policy.Non429IsolationAction == "" || normalizeNon429IsolationAction(data.Policy.Non429IsolationAction) == "" {
-		// 旧版 disable_auth_on_hard 不再读取；缺省等价 isolate_only
-		data.Policy.Non429IsolationAction = non429IsolationIsolateOnly
-	} else {
-		data.Policy.Non429IsolationAction = normalizeNon429IsolationAction(data.Policy.Non429IsolationAction)
+	if data.Policy.MinOutputTokens <= 0 {
+		data.Policy.MinOutputTokens = 32
+	}
+	if data.Policy.MaxOutputTokensProbe <= 0 {
+		data.Policy.MaxOutputTokensProbe = 384
+	}
+	if data.Policy.Mode == "" {
+		data.Policy.Mode = "hybrid"
+	}
+	if data.Policy.ActiveIntervalSec <= 0 {
+		data.Policy.ActiveIntervalSec = 1800
+	}
+	if data.Policy.PassivePollSec <= 0 {
+		data.Policy.PassivePollSec = 5
+	}
+	if data.Policy.QuarantineSec <= 0 {
+		data.Policy.QuarantineSec = 120
 	}
 	// hydrate private proxy field
 	for _, n := range data.Nodes {
@@ -214,7 +215,9 @@ func (s *stateStore) persistLocked() error {
 	for _, n := range s.data.Nodes {
 		n.ProxyURLStored = n.ProxyURL
 	}
-	raw, err := json.MarshalIndent(s.data, "", "  ")
+	// Compact JSON is enough for a machine-owned state file and is much
+	// cheaper than MarshalIndent on every observation tick.
+	raw, err := json.Marshal(s.data)
 	if err != nil {
 		return err
 	}
@@ -222,7 +225,52 @@ func (s *stateStore) persistLocked() error {
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return err
 	}
+	s.dirty = false
 	return os.Rename(tmp, s.path)
+}
+
+// scheduleFlushLocked coalesces non-critical writes. Caller holds s.mu.
+func (s *stateStore) scheduleFlushLocked() {
+	s.dirty = true
+	delay := s.flushDelay
+	if delay <= 0 {
+		delay = 2 * time.Second
+	}
+	if s.flushTimer != nil {
+		return
+	}
+	s.flushTimer = time.AfterFunc(delay, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.flushTimer = nil
+		if !s.dirty {
+			return
+		}
+		_ = s.persistLocked()
+	})
+}
+
+// flushNowLocked cancels a pending timer and writes immediately. Caller holds s.mu.
+func (s *stateStore) flushNowLocked() error {
+	if s.flushTimer != nil {
+		s.flushTimer.Stop()
+		s.flushTimer = nil
+	}
+	return s.persistLocked()
+}
+
+// Flush writes any dirty state. Safe for shutdown / tests.
+func (s *stateStore) Flush() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.dirty && s.flushTimer == nil {
+		// still fine to no-op; callers may want a barrier after critical ops
+		return nil
+	}
+	return s.flushNowLocked()
 }
 
 func (s *stateStore) snapshot() guardState {
@@ -257,6 +305,9 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 	if p.Mode == "" {
 		p.Mode = "hybrid"
 	}
+	if p.Mode != "active" && p.Mode != "passive" && p.Mode != "hybrid" {
+		return fmt.Errorf("模式必须是 active、passive 或 hybrid")
+	}
 	if p.Model == "" {
 		p.Model = "grok-4.5"
 	}
@@ -269,64 +320,29 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 	if p.QuarantineSec <= 0 {
 		p.QuarantineSec = 120
 	}
+	if p.ActiveIntervalSec < 60 || p.ActiveIntervalSec > 86400 {
+		return fmt.Errorf("主动检测间隔需在 60 到 86400 秒之间")
+	}
+	if p.PassivePollSec < 1 || p.PassivePollSec > 3600 {
+		return fmt.Errorf("被动审计间隔需在 1 到 3600 秒之间")
+	}
+	if p.QuarantineSec < 10 || p.QuarantineSec > 86400 {
+		return fmt.Errorf("隔离复测间隔需在 10 到 86400 秒之间")
+	}
 	if p.MinHealthyNodes <= 0 {
 		p.MinHealthyNodes = 1
 	}
-	if p.HTTP429AccountAction == "" {
-		p.HTTP429AccountAction = http429AccountActionDelete
+	if p.MinGenerationMs < 200 || p.MinGenerationMs > 10000 {
+		return fmt.Errorf("最短生成窗口需在 200 到 10000 毫秒之间")
 	}
-	if p.HTTP429AccountAction != http429AccountActionDelete && p.HTTP429AccountAction != http429AccountActionCooldown24 {
-		return fmt.Errorf("429 账号处理策略无效")
+	if p.MinOutputTokens < 1 || p.MinOutputTokens > 10000 {
+		return fmt.Errorf("最小判定 Token 数需在 1 到 10000 之间")
 	}
-	if p.Non429IsolationAction == "" {
-		p.Non429IsolationAction = non429IsolationIsolateOnly
+	if p.MaxOutputTokensProbe < 16 || p.MaxOutputTokensProbe > 4096 {
+		return fmt.Errorf("主动探测最大输出需在 16 到 4096 Token 之间")
 	}
-	if normalizeNon429IsolationAction(p.Non429IsolationAction) == "" {
-		return fmt.Errorf("非 429 隔离后处理策略无效")
-	}
-	p.Non429IsolationAction = normalizeNon429IsolationAction(p.Non429IsolationAction)
 	s.data.Policy = p
 	return s.persistLocked()
-}
-
-func accountCooldownKey(a authFile) string {
-	if name := filepath.Base(strings.TrimSpace(a.Name)); name != "" && name != "." {
-		return "name:" + name
-	}
-	return "index:" + strings.TrimSpace(a.Index)
-}
-
-func (s *stateStore) isAccountCooling(a authFile, now time.Time) bool {
-	key := accountCooldownKey(a)
-	if key == "index:" {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cooldown, ok := s.data.AccountCooldowns[key]
-	if !ok || cooldown.Until <= float64(now.Unix()) {
-		if ok {
-			delete(s.data.AccountCooldowns, key)
-			_ = s.persistLocked()
-		}
-		return false
-	}
-	return true
-}
-
-func (s *stateStore) coolAccountFor(a authFile, duration time.Duration) (time.Time, error) {
-	key := accountCooldownKey(a)
-	if key == "index:" {
-		return time.Time{}, fmt.Errorf("账号缺少可持久化标识")
-	}
-	until := time.Now().Add(duration).UTC()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.data.AccountCooldowns == nil {
-		s.data.AccountCooldowns = map[string]accountCooldown{}
-	}
-	s.data.AccountCooldowns[key] = accountCooldown{Until: float64(until.Unix())}
-	return until, s.persistLocked()
 }
 
 func (s *stateStore) listNodes() []*nodeRecord {
@@ -356,130 +372,74 @@ func (s *stateStore) getNode(id string) (*nodeRecord, bool) {
 	return &cp, true
 }
 
-func (s *stateStore) getNodeByProxy(proxyURL string) (*nodeRecord, bool) {
-	proxyURL = strings.TrimSpace(proxyURL)
-	if proxyURL == "" {
-		return nil, false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, n := range s.data.Nodes {
-		if n != nil && n.ProxyURL == proxyURL {
-			cp := *n
-			return &cp, true
-		}
-	}
-	return nil, false
-}
-
 func (s *stateStore) createNode(name, proxyURL string, enabled, pool bool, capacity int) (*nodeRecord, error) {
-	items, err := s.createNodes(name, []string{proxyURL}, enabled, pool, capacity)
+	created, err := s.createNodes([]nodeCreateInput{{
+		Name:            name,
+		ProxyURL:        proxyURL,
+		Enabled:         enabled,
+		ProxyPool:       pool,
+		AccountCapacity: capacity,
+	}})
 	if err != nil {
 		return nil, err
 	}
-	return items[0], nil
+	return created[0], nil
 }
 
-// createNodes creates one node per proxy URL. A single URL keeps baseName as-is;
-// multiple URLs append a zero-padded suffix (name-01, name-02, ...).
-func (s *stateStore) createNodes(baseName string, proxyURLs []string, enabled, pool bool, capacity int) ([]*nodeRecord, error) {
+func (s *stateStore) createNodes(inputs []nodeCreateInput) ([]*nodeRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	baseName = strings.TrimSpace(baseName)
-	proxies := uniqueNonEmpty(proxyURLs)
-	if baseName == "" || len(proxies) == 0 {
-		return nil, fmt.Errorf("名称和代理 URL 必填")
+	if len(inputs) == 0 {
+		return nil, fmt.Errorf("至少提供一个节点")
 	}
-	now := time.Now().UTC()
-	width := len(fmt.Sprintf("%d", len(proxies)))
-	if width < 2 {
-		width = 2
+	if len(inputs) > 500 {
+		return nil, fmt.Errorf("单次最多导入 500 个节点")
 	}
-	out := make([]*nodeRecord, 0, len(proxies))
-	for i, proxyURL := range proxies {
-		name := baseName
-		if len(proxies) > 1 {
-			name = fmt.Sprintf("%s-%0*d", baseName, width, i+1)
+	for index := range inputs {
+		inputs[index].Name = strings.TrimSpace(inputs[index].Name)
+		inputs[index].ProxyURL = strings.TrimSpace(inputs[index].ProxyURL)
+		if inputs[index].Name == "" || inputs[index].ProxyURL == "" {
+			return nil, fmt.Errorf("第 %d 个节点缺少名称或代理 URL", index+1)
 		}
+		if err := validateProxyURL(inputs[index].ProxyURL); err != nil {
+			return nil, fmt.Errorf("第 %d 个节点代理 URL 无效: %w", index+1, err)
+		}
+		if inputs[index].AccountCapacity < 0 || inputs[index].AccountCapacity > 100000 {
+			return nil, fmt.Errorf("第 %d 个节点容量需在 0 到 100000 之间", index+1)
+		}
+	}
+	previousNextID := s.data.NextID
+	now := time.Now().UTC()
+	created := make([]*nodeRecord, 0, len(inputs))
+	createdIDs := make([]string, 0, len(inputs))
+	for _, input := range inputs {
 		id := fmt.Sprintf("%d", s.data.NextID)
 		s.data.NextID++
 		n := &nodeRecord{
 			ID:              id,
-			Name:            name,
-			ProxyURL:        proxyURL,
-			ProxyURLStored:  proxyURL,
-			Enabled:         enabled,
-			ProxyPool:       pool,
-			AccountCapacity: capacity,
+			Name:            input.Name,
+			ProxyURL:        input.ProxyURL,
+			ProxyURLStored:  input.ProxyURL,
+			Enabled:         input.Enabled,
+			ProxyPool:       input.ProxyPool,
+			AccountCapacity: input.AccountCapacity,
 			ProbeStatus:     "unknown",
 			CreatedAt:       now,
 			UpdatedAt:       now,
 		}
 		s.data.Nodes[id] = n
+		createdIDs = append(createdIDs, id)
 		cp := *n
-		out = append(out, &cp)
+		created = append(created, &cp)
 	}
 	if err := s.persistLocked(); err != nil {
+		for _, id := range createdIDs {
+			delete(s.data.Nodes, id)
+		}
+		s.data.NextID = previousNextID
 		return nil, err
 	}
-	return out, nil
-}
-
-func uniqueNonEmpty(values []string) []string {
-	seen := make(map[string]struct{}, len(values))
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			continue
-		}
-		if _, ok := seen[value]; ok {
-			continue
-		}
-		seen[value] = struct{}{}
-		out = append(out, value)
-	}
-	return out
-}
-
-type exitIPDedupGroup struct {
-	ExitIP    string   `json:"exit_ip"`
-	KeepID    string   `json:"keep_id"`
-	DeleteIDs []string `json:"delete_ids"`
-}
-
-func nodeIDLess(left, right string) bool {
-	leftNumber, leftErr := strconv.ParseUint(left, 10, 64)
-	rightNumber, rightErr := strconv.ParseUint(right, 10, 64)
-	if leftErr == nil && rightErr == nil {
-		return leftNumber < rightNumber
-	}
-	return left < right
-}
-
-func planExitIPDedup(nodes []*nodeRecord) []exitIPDedupGroup {
-	byExitIP := map[string][]*nodeRecord{}
-	for _, node := range nodes {
-		if node == nil || strings.TrimSpace(node.ExitIP) == "" {
-			continue
-		}
-		ip := strings.TrimSpace(node.ExitIP)
-		byExitIP[ip] = append(byExitIP[ip], node)
-	}
-	groups := make([]exitIPDedupGroup, 0)
-	for exitIP, groupNodes := range byExitIP {
-		if len(groupNodes) < 2 {
-			continue
-		}
-		sort.Slice(groupNodes, func(i, j int) bool { return nodeIDLess(groupNodes[i].ID, groupNodes[j].ID) })
-		deleteIDs := make([]string, 0, len(groupNodes)-1)
-		for _, node := range groupNodes[1:] {
-			deleteIDs = append(deleteIDs, node.ID)
-		}
-		groups = append(groups, exitIPDedupGroup{ExitIP: exitIP, KeepID: groupNodes[0].ID, DeleteIDs: deleteIDs})
-	}
-	sort.Slice(groups, func(i, j int) bool { return groups[i].ExitIP < groups[j].ExitIP })
-	return groups
+	return created, nil
 }
 
 func (s *stateStore) updateNode(id string, mut func(*nodeRecord) error) (*nodeRecord, error) {
@@ -489,16 +449,50 @@ func (s *stateStore) updateNode(id string, mut func(*nodeRecord) error) (*nodeRe
 	if !ok {
 		return nil, fmt.Errorf("节点不存在")
 	}
+	beforeGuard := n.DisabledByGuard
+	beforeUntil := n.QuarantinedUntil
+	beforeEnabled := n.Enabled
+	beforeProxy := n.ProxyURL
 	if err := mut(n); err != nil {
 		return nil, err
 	}
+	if n.ProxyURL != "" {
+		if err := validateProxyURL(n.ProxyURL); err != nil {
+			return nil, err
+		}
+	}
 	n.UpdatedAt = time.Now().UTC()
-	if err := s.persistLocked(); err != nil {
+	// Quarantine / enable / proxy changes must hit disk immediately so a crash
+	// cannot resurrect a known-bad egress. Pure observation metrics can wait.
+	critical := n.DisabledByGuard != beforeGuard ||
+		n.QuarantinedUntil != beforeUntil ||
+		n.Enabled != beforeEnabled ||
+		n.ProxyURL != beforeProxy
+	var err error
+	if critical {
+		err = s.flushNowLocked()
+	} else {
+		s.scheduleFlushLocked()
+	}
+	if err != nil {
 		return nil, err
 	}
 	cp := *n
 	cp.ProxyURL = n.ProxyURL
 	return &cp, nil
+}
+
+func validateProxyURL(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("代理 URL 必须包含主机和端口")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+		return nil
+	default:
+		return fmt.Errorf("代理协议仅支持 http、https、socks5 或 socks5h")
+	}
 }
 
 func (s *stateStore) deleteNodes(ids []string) error {
@@ -532,7 +526,7 @@ func (s *stateStore) appendEvent(ev guardEvent) {
 	if len(s.data.Events) > 100 {
 		s.data.Events = s.data.Events[len(s.data.Events)-100:]
 	}
-	_ = s.persistLocked()
+	s.scheduleFlushLocked()
 }
 
 func (s *stateStore) events() []guardEvent {
@@ -569,8 +563,10 @@ func (s *stateStore) bumpStat(source, class string, tokens int64) {
 		ps.Hard++
 	case "error":
 		ps.Errors++
+	case "ignored", "account_error", "upstream_error", "no_account":
+		ps.Ignored++
 	}
-	_ = s.persistLocked()
+	s.scheduleFlushLocked()
 }
 
 func (s *stateStore) bumpAction(kind string) {
@@ -584,7 +580,7 @@ func (s *stateStore) bumpAction(kind string) {
 	case "suppressed":
 		s.data.Stats.Actions.Suppressed++
 	}
-	_ = s.persistLocked()
+	s.scheduleFlushLocked()
 }
 
 func (s *stateStore) setAssignedCounts(counts map[string]int) {
@@ -593,7 +589,22 @@ func (s *stateStore) setAssignedCounts(counts map[string]int) {
 	for id, n := range s.data.Nodes {
 		n.AssignedAccountCount = counts[id]
 	}
-	_ = s.persistLocked()
+	s.scheduleFlushLocked()
+}
+
+// nodeIDByProxy returns the node id bound to proxyURL (O(nodes), typically small).
+func (s *stateStore) nodeIDByProxy(proxyURL string) string {
+	if s == nil || proxyURL == "" {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, n := range s.data.Nodes {
+		if n.ProxyURL == proxyURL {
+			return n.ID
+		}
+	}
+	return ""
 }
 
 func publicNode(n *nodeRecord) map[string]any {

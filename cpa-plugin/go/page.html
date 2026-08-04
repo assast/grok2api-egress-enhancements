@@ -54,10 +54,10 @@
     .toolbar { flex-wrap: wrap; justify-content: flex-end; }
     .search { width: min(16rem, 100%); }
     input, select, textarea { min-height: 2.25rem; width: 100%; border: var(--rule-hairline) solid var(--input); border-radius: var(--radius-sm); padding: 0 var(--space-xs); background: var(--background); color: var(--foreground); }
-    textarea { min-height: 7.5rem; padding: var(--space-2xs) var(--space-xs); resize: vertical; line-height: 1.45; font-family: var(--font-mono); }
+    textarea { min-height: 14rem; resize: vertical; padding: var(--space-xs); font-family: var(--font-mono); font-size: var(--text-xs); line-height: 1.6; }
     input:hover, select:hover, textarea:hover { border-color: var(--ring); }
-    input:user-invalid, select:user-invalid, textarea:user-invalid { border-color: var(--destructive); background: var(--danger-surface); }
-    input:disabled, select:disabled, textarea:disabled { opacity: 0.55; cursor: not-allowed; background: var(--muted); }
+    input:user-invalid, select:user-invalid { border-color: var(--destructive); background: var(--danger-surface); }
+    input:disabled, select:disabled { opacity: 0.55; cursor: not-allowed; background: var(--muted); }
     input::placeholder, textarea::placeholder { color: var(--muted-foreground); }
     input[type="checkbox"] { width: 1rem; min-height: 1rem; accent-color: var(--primary); }
     .batch-bar { min-height: 3rem; display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm); padding: var(--space-2xs) var(--space-sm); border-bottom: var(--rule-hairline) solid var(--border); background: var(--muted); }
@@ -180,12 +180,12 @@
     <header class="page-head">
       <div>
         <h1>出口守护</h1>
-        <p>纯 CPA 实现 · Group Free 降智隔离 · 节点 CRUD · 质量检测 · 账号通道绑定</p>
+        <p>纯 CPA 实现 · 出口质量隔离 · 节点 CRUD · 质量检测 · 账号通道绑定</p>
       </div>
       <div class="head-actions">
         <span class="status-line"><span id="service-dot" class="status-dot"></span><span id="service-text">正在连接</span></span>
         <button id="theme-button" class="button icon ghost" type="button" title="切换深浅色" aria-label="切换深浅色">◐</button>
-        <button id="refresh-button" class="button" type="button">刷新</button>
+        <button id="refresh-button" class="button" type="button" title="刷新页面快照，不会立即运行真实模型质量检测">刷新显示</button>
       </div>
     </header>
 
@@ -198,11 +198,11 @@
 
     <section class="section" aria-labelledby="nodes-title">
       <div class="section-head">
-        <div><h2 id="nodes-title">出口节点</h2><p>代理凭据仅在保存时提交，页面不会读取或回显</p></div>
+        <div><h2 id="nodes-title">出口节点</h2><p id="nodes-freshness">页面每 15 秒刷新；节点健康状态随请求审计或主动检测更新，代理凭据不会回显</p></div>
         <div class="toolbar">
           <input id="node-search" class="search" type="search" placeholder="搜索节点、IP 或 ID" aria-label="搜索节点">
           <button id="rebalance-nodes" class="button" type="button" title="按启用节点把 CPA 账号 proxy_url 重新均分">重平衡账号</button>
-          <button id="deduplicate-exit-ips" class="button danger" type="button" title="按出口 IP 剔重，每组仅保留最小 ID 的节点">剔重出口 IP</button>
+          <button id="bulk-add-node" class="button" type="button">批量添加</button>
           <button id="add-node" class="button primary" type="button">添加节点</button>
         </div>
       </div>
@@ -250,12 +250,24 @@
       <form id="node-form">
         <div class="modal-body form-grid">
           <div class="field full check-row"><label for="node-enabled">启用节点</label><input id="node-enabled" type="checkbox" checked></div>
-          <div class="field"><label for="node-name">名称</label><input id="node-name" required maxlength="120" autocomplete="off" placeholder="例如 grok-build-sticky-04"><p class="help">批量导入多行代理时作为前缀</p></div>
+          <div class="field"><label for="node-name">名称</label><input id="node-name" required maxlength="120" autocomplete="off" placeholder="例如 grok-build-sticky-04"></div>
           <div class="field"><label for="node-capacity">账号容量</label><input id="node-capacity" type="number" min="0" max="100000" value="0"><p class="help">0 表示不限制</p></div>
-          <div class="field full"><label for="node-proxy">代理 URL</label><textarea id="node-proxy" rows="5" spellcheck="false" autocomplete="off" placeholder="socks5h://user:pass@host:port&#10;一行一个，可粘贴多行批量导入"></textarea><p id="node-proxy-help" class="help">创建时必填，支持多行（一行一个）；批量导入时名称作为前缀。编辑时留空表示保留现有代理</p></div>
+          <div class="field full"><label for="node-proxy">代理 URL</label><input id="node-proxy" type="password" autocomplete="new-password" placeholder="socks5h://user:pass@host:port"><p id="node-proxy-help" class="help">创建节点时必填；编辑时留空表示保留现有代理</p></div>
           <div class="field full check-row"><div><label for="node-pool">代理池模式</label><p class="help">动态轮换代理开启；静态或固定代理关闭</p></div><input id="node-pool" type="checkbox"></div>
         </div>
         <div class="modal-actions"><button class="button" type="button" data-close="node-modal">取消</button><button id="save-node" class="button primary" type="submit">保存</button></div>
+      </form>
+    </section>
+  </div>
+
+  <div id="bulk-node-modal" class="modal-layer" hidden>
+    <section class="modal wide" role="dialog" aria-modal="true" aria-labelledby="bulk-node-modal-title">
+      <div class="modal-head"><div><h3 id="bulk-node-modal-title">批量添加节点</h3><p>单次最多 500 个；任一行无效时整批不导入</p></div><button class="button icon ghost" type="button" data-close="bulk-node-modal" aria-label="关闭">×</button></div>
+      <form id="bulk-node-form">
+        <div class="modal-body">
+          <div class="field"><label for="bulk-node-input">节点列表</label><textarea id="bulk-node-input" required autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="# 每行一种格式&#10;socks5h://user:pass@host:port&#10;美西固定 01 | http://user:pass@host:port | 20 | fixed&#10;轮换池 01 | socks5h://user:pass@host:port | 50 | pool"></textarea><p id="bulk-node-summary" class="help">格式：代理 URL，或 名称 | 代理 URL | 容量 | fixed/pool；空行和 # 注释会忽略</p></div>
+        </div>
+        <div class="modal-actions"><button class="button" type="button" data-close="bulk-node-modal">取消</button><button id="import-nodes" class="button primary" type="submit">导入节点</button></div>
       </form>
     </section>
   </div>
@@ -273,9 +285,12 @@
           <div class="field"><label for="policy-hard">硬阈值 Token/s</label><input id="policy-hard" type="number" min="2" max="10000" step="1"></div>
           <div class="field"><label for="policy-soft-count">连续软异常次数</label><input id="policy-soft-count" type="number" min="1" max="20"></div>
           <div class="field"><label for="policy-error-count">连续错误次数</label><input id="policy-error-count" type="number" min="1" max="20"></div>
-          <div class="field full"><label for="policy-429-account-action">上游 HTTP 429 账号处理</label><select id="policy-429-account-action"><option value="cooldown_24h">账号冷却 24 小时（默认；不计节点错误、不隔离节点）</option><option value="delete_account">直接删除命中账号</option></select><small>冷却策略只跳过质量探测，不改变 CPA 正常流量调度。</small></div>
-          <div class="field full"><label for="policy-non429-isolation-action">非 429 隔离后处理</label><select id="policy-non429-isolation-action"><option value="isolate_only">只隔离节点（默认；账号迁走或禁用）</option><option value="isolate_and_delete">隔离节点 + 删除命中账号</option><option value="delete_account_only">只删除命中账号（不隔离节点）</option></select><small>仅对本次探测/被动命中的账号生效；与 429 策略独立。</small></div>
-          <div class="field full"><label for="policy-min-healthy">最低健康节点数</label><input id="policy-min-healthy" type="number" min="1" max="1000"></div>
+          <div class="field"><label for="policy-min-generation">最短生成窗口（毫秒）</label><input id="policy-min-generation" type="number" min="200" max="10000"></div>
+          <div class="field"><label for="policy-min-output">最小判定 Token 数</label><input id="policy-min-output" type="number" min="1" max="10000"></div>
+          <div class="field"><label for="policy-max-output">主动探测最大输出 Token</label><input id="policy-max-output" type="number" min="16" max="4096"></div>
+          <div class="field"><label for="policy-model">主动探测模型</label><input id="policy-model" maxlength="120" autocomplete="off"></div>
+          <div class="field"><label for="policy-min-healthy">最低健康节点数</label><input id="policy-min-healthy" type="number" min="1" max="1000"></div>
+          <div class="field full check-row"><div><label for="policy-disable-auth">迁移失败时停用原节点账号</label><p class="help">启用可防止坏出口继续接收请求；手动停用账号不会被自动恢复</p></div><input id="policy-disable-auth" type="checkbox"></div>
         </div>
         <div class="modal-actions"><button class="button" type="button" data-close="policy-modal">取消</button><button id="save-policy" class="button primary" type="submit">保存策略</button></div>
       </form>
@@ -308,8 +323,6 @@
     const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
     const number = (value) => new Intl.NumberFormat('zh-CN').format(Number(value || 0));
     const modeName = (mode) => ({active:'主动', passive:'被动', hybrid:'混合'})[mode] || '-';
-    const http429AccountActionName = (action) => ({delete_account:'直接删除账号', cooldown_24h:'冷却 24 小时'})[action] || '冷却 24 小时';
-    const non429IsolationActionName = (action) => ({isolate_only:'只隔离节点', isolate_and_delete:'隔离节点 + 删除命中账号', delete_account_only:'只删除命中账号'})[action] || '只隔离节点';
     const time = (value, epoch = false) => {
       if (!value) return '-';
       const date = epoch ? new Date(Number(value) * 1000) : new Date(value);
@@ -444,6 +457,18 @@
       if (left < 60) return left + ' 秒后复测';
       return Math.ceil(left / 60) + ' 分钟后复测';
     }
+    function nextObservation(node, guard) {
+      const cfg = state.status?.config || {};
+      if (guard.disabled_by_guard) return quarantineCountdown(guard) || '等待隔离复测';
+      if (cfg.mode === 'passive') return '随下一次请求更新';
+      const interval = Number(cfg.active_interval_seconds || 0);
+      const last = Number(guard.last_probe_at || 0);
+      if (!interval || !last) return cfg.mode === 'active' || cfg.mode === 'hybrid' ? '等待主动检测' : '随下一次请求更新';
+      const left = Math.max(0, Math.round(last + interval - Date.now() / 1000));
+      if (left === 0) return '主动检测待执行';
+      if (left < 60) return left + ' 秒后主动检测';
+      return Math.ceil(left / 60) + ' 分钟后主动检测';
+    }
     function actionButtons(node) {
       return '<div class="row-actions">' +
         '<button class="button" type="button" data-action="quality" title="真实模型质量检测">质量</button>' +
@@ -480,7 +505,7 @@
           '<td class="numeric ' + tpsClass + '">' + (observed ? Number(guard.last_output_tps || 0).toFixed(1) : '-') + '</td>' +
           '<td class="numeric">' + (guard.last_first_token_ms ? number(guard.last_first_token_ms) + ' ms' : '-') + '</td>' +
           '<td><div>' + number(node.assignedAccountCount) + ' / ' + (node.accountCapacity || '∞') + '</div><div class="subtext">已绑定 / 容量</div></td>' +
-          '<td title="' + esc(time(observed, true)) + '">' + relative(observed) + '<div class="subtext">' + esc(guard.last_source || '-') + '</div></td>' +
+          '<td title="' + esc(time(observed, true)) + '">' + relative(observed) + '<div class="subtext" title="' + esc(nextObservation(node, guard)) + '">' + esc(nextObservation(node, guard)) + '</div></td>' +
           '<td class="actions-col">' + actionButtons(node) + '</td></tr>';
       }).join('');
       $('node-cards').innerHTML = nodes.map((node) => {
@@ -501,13 +526,13 @@
       }).join('');
     }
     function renderStatistics() {
-      const stats = state.status?.statistics || {started_at:0,active:{total:0,healthy:0,soft:0,hard:0,errors:0,output_tokens:0},passive:{total:0,healthy:0,soft:0,hard:0,errors:0,output_tokens:0},actions:{quarantined:0,restored:0,suppressed:0}};
+      const stats = state.status?.statistics || {started_at:0,active:{total:0,healthy:0,soft:0,hard:0,errors:0,ignored:0,output_tokens:0},passive:{total:0,healthy:0,soft:0,hard:0,errors:0,ignored:0,output_tokens:0},actions:{quarantined:0,restored:0,suppressed:0}};
       const anomalies = stats.active.soft + stats.active.hard + stats.passive.soft + stats.passive.hard;
       const items = [
         ['自动检测', stats.active.total + stats.passive.total, '主动 + 被动'],
-        ['主动探测', stats.active.total, '健康 ' + number(stats.active.healthy) + ' · 错误 ' + number(stats.active.errors)],
-        ['被动审计', stats.passive.total, '健康 ' + number(stats.passive.healthy)],
-        ['探测 Token', stats.active.output_tokens, '包含推理 Token'],
+        ['主动探测', stats.active.total, '健康 ' + number(stats.active.healthy) + ' · 错误 ' + number(stats.active.errors) + ' · 忽略 ' + number(stats.active.ignored)],
+        ['被动审计', stats.passive.total, '健康 ' + number(stats.passive.healthy) + ' · 忽略 ' + number(stats.passive.ignored)],
+        ['探测 Token', stats.active.output_tokens, '按 CPA 输出总量统计'],
         ['异常命中', anomalies, '软 ' + number(stats.active.soft + stats.passive.soft) + ' · 硬 ' + number(stats.active.hard + stats.passive.hard)],
         ['隔离操作', stats.actions.quarantined, '恢复 ' + number(stats.actions.restored) + ' · 抑制 ' + number(stats.actions.suppressed)]
       ];
@@ -517,21 +542,25 @@
     function renderEvents() {
       const events = state.status?.recentEvents || [];
       if (!events.length) { $('events-list').innerHTML = '<div class="empty">暂无守护事件</div>'; return; }
-      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',node_rotated:'出口 IP 已轮换',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',account_429_deleted:'429 账号已删除',account_429_cooled:'429 账号已冷却',exit_ip_deduplicated:'出口 IP 已剔重',account_deleted_on_isolation:'隔离并删除账号',account_deleted_only:'仅删除账号',account_delete_skipped:'删号已跳过'};
-      $('events-list').innerHTML = events.slice().reverse().map((event) => {
-        const authLabel = ' · 账号 ' + (event.auth_id || '—');
-        return '<div class="event"><div><strong>' + esc(names[event.event] || event.event || '守护事件') + ' · ' + esc(event.node_name || (event.node_id ? ('节点 ' + event.node_id) : '—')) + esc(authLabel) + '</strong><small>' + esc(event.reason || event.classification || '-') + (event.output_tps ? ' · ' + Number(event.output_tps).toFixed(1) + ' Token/s' : '') + '</small></div><time>' + relative(event.ts) + '</time></div>';
-      }).join('');
+      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败'};
+      $('events-list').innerHTML = events.slice().reverse().map((event) => '<div class="event"><div><strong>' + esc(names[event.event] || event.event || '守护事件') + ' · ' + esc(event.node_name || ('节点 ' + event.node_id)) + '</strong><small>' + esc(event.reason || event.classification || '-') + (event.output_tps ? ' · ' + Number(event.output_tps).toFixed(1) + ' Token/s' : '') + '</small></div><time>' + relative(event.ts) + '</time></div>').join('');
     }
     function renderPolicy() {
       const cfg = state.status?.config;
       $('edit-policy').disabled = !cfg;
       if (!cfg) { $('policy-view').innerHTML = '<div class="empty">策略状态不可用</div>'; return; }
-      const values = [['模式',modeName(cfg.mode)],['主动间隔',cfg.active_interval_seconds + ' 秒'],['被动轮询',cfg.passive_poll_seconds + ' 秒'],['软 / 硬阈值',cfg.soft_tps + ' / ' + cfg.hard_tps],['连续异常',cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],['隔离复测',cfg.quarantine_seconds + ' 秒'],['429 账号处理',http429AccountActionName(cfg.http_429_account_action)],['非 429 隔离后处理',non429IsolationActionName(cfg.non_429_isolation_action)],['最低健康节点',cfg.min_healthy_nodes],['模型',cfg.model]];
+      const values = [['模式',modeName(cfg.mode)],['主动间隔',cfg.active_interval_seconds + ' 秒'],['被动轮询',cfg.passive_poll_seconds + ' 秒'],['软 / 硬阈值',cfg.soft_tps + ' / ' + cfg.hard_tps],['连续异常',cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],['最短生成窗口',(cfg.min_generation_ms || 1000) + ' ms'],['最小判定 Token',cfg.min_output_tokens || 32],['隔离复测',cfg.quarantine_seconds + ' 秒'],['最低健康节点',cfg.min_healthy_nodes],['探测输出',(cfg.max_output_tokens || 384) + ' Token'],['模型',cfg.model],['迁移失败停用',cfg.disable_auth_on_hard ? '是' : '否']];
       $('policy-view').innerHTML = values.map((value) => '<div><dt>' + value[0] + '</dt><dd>' + esc(value[1]) + '</dd></div>').join('');
     }
-    function openModal(id) { $(id).hidden = false; document.body.style.overflow = 'hidden'; $(id).querySelector('input,select,button')?.focus(); }
-    function closeModal(id) { $(id).hidden = true; document.body.style.overflow = ''; }
+    function openModal(id) { $(id).hidden = false; document.body.style.overflow = 'hidden'; $(id).querySelector('input,select,textarea,button')?.focus(); }
+    function closeModal(id) {
+      $(id).hidden = true;
+      document.body.style.overflow = '';
+      if (id === 'bulk-node-modal') {
+        $('bulk-node-input').value = '';
+        $('bulk-node-summary').textContent = '格式：代理 URL，或 名称 | 代理 URL | 容量 | fixed/pool；空行和 # 注释会忽略';
+      }
+    }
     function openNode(node = null) {
       state.editing = node;
       $('node-modal-title').textContent = node ? '编辑节点' : '添加节点';
@@ -541,10 +570,6 @@
       $('node-pool').checked = Boolean(node?.proxyPool);
       $('node-proxy').value = '';
       $('node-proxy').required = !node;
-      $('node-proxy').rows = node ? 2 : 5;
-      $('node-proxy-help').textContent = node
-        ? '编辑时只支持单个代理 URL；留空表示保留现有代理'
-        : '创建时必填，支持多行（一行一个）；批量导入时名称作为前缀自动生成 name-01、name-02…';
       openModal('node-modal');
     }
     function openPolicy() {
@@ -552,10 +577,44 @@
       if (!cfg) return;
       $('policy-mode').value = cfg.mode; $('policy-active').value = cfg.active_interval_seconds; $('policy-passive').value = cfg.passive_poll_seconds;
       $('policy-quarantine').value = cfg.quarantine_seconds; $('policy-soft').value = cfg.soft_tps; $('policy-hard').value = cfg.hard_tps;
-      $('policy-soft-count').value = cfg.consecutive_soft; $('policy-error-count').value = cfg.consecutive_errors; $('policy-min-healthy').value = cfg.min_healthy_nodes;
-      $('policy-429-account-action').value = cfg.http_429_account_action || 'cooldown_24h';
-      $('policy-non429-isolation-action').value = cfg.non_429_isolation_action || 'isolate_only';
+      $('policy-soft-count').value = cfg.consecutive_soft; $('policy-error-count').value = cfg.consecutive_errors; $('policy-min-generation').value = cfg.min_generation_ms || 1000; $('policy-min-output').value = cfg.min_output_tokens || 32; $('policy-max-output').value = cfg.max_output_tokens || 384; $('policy-model').value = cfg.model || 'grok-4.5'; $('policy-disable-auth').checked = cfg.disable_auth_on_hard !== false; $('policy-min-healthy').value = cfg.min_healthy_nodes;
       openModal('policy-modal');
+    }
+    function parseBulkNodes(raw) {
+      const items = [];
+      const errors = [];
+      raw.split(/\r?\n/).forEach((source, index) => {
+        const line = source.trim();
+        if (!line || line.startsWith('#') || line.startsWith('//')) return;
+        const parts = line.split('|').map((part) => part.trim());
+        let name = '';
+        let proxyURL = '';
+        let capacity = 0;
+        let proxyPool = false;
+        if (parts.length === 1) {
+          proxyURL = parts[0];
+        } else if (parts.length >= 2 && parts.length <= 4) {
+          [name, proxyURL] = parts;
+          if (parts[2]) {
+            capacity = Number(parts[2]);
+            if (!Number.isInteger(capacity) || capacity < 0 || capacity > 100000) errors.push('第 ' + (index + 1) + ' 行容量需为 0 到 100000 的整数');
+          }
+          if (parts[3]) {
+            const type = parts[3].toLowerCase();
+            if (type !== 'fixed' && type !== 'pool') errors.push('第 ' + (index + 1) + ' 行类型只能是 fixed 或 pool');
+            proxyPool = type === 'pool';
+          }
+        } else {
+          errors.push('第 ' + (index + 1) + ' 行字段数量不正确');
+          return;
+        }
+        if (!proxyURL) errors.push('第 ' + (index + 1) + ' 行缺少代理 URL');
+        items.push({name, proxyURL, accountCapacity:capacity, proxyPool, enabled:true});
+      });
+      if (!items.length) errors.push('没有可导入的节点');
+      if (items.length > 500) errors.push('单次最多导入 500 个节点');
+      if (errors.length) throw new Error(errors[0] + (errors.length > 1 ? '（另有 ' + (errors.length - 1) + ' 处错误）' : ''));
+      return items;
     }
     function confirmAction(title, message, action) {
       $('confirm-title').textContent = title; $('confirm-message').textContent = message; state.confirm = action; openModal('confirm-modal');
@@ -576,18 +635,6 @@
     }
     async function testConnectivity(ids, button) {
       await mutate(button, () => api('/nodes/test', {method:'POST', body:{ids}}), '连通性检测完成');
-    }
-    async function deduplicateExitIPs(button) {
-      busy(button, true);
-      try {
-        const preview = await api('/nodes/deduplicate-exit-ips', {method:'POST', body:{}});
-        const groups = preview.groups || [];
-        const duplicateCount = Number(preview.duplicate_nodes || 0);
-        if (!groups.length || !duplicateCount) { toast('未发现重复出口 IP'); return; }
-        const summary = groups.map((group) => group.exit_ip + '：保留 ID ' + group.keep_id + '，剔除 ' + group.delete_ids.join('、')).join('；');
-        confirmAction('确认剔重出口 IP', '将剔除 ' + duplicateCount + ' 个节点，并将其绑定账号改绑到同 IP 的保留节点。' + summary, (confirmButton) => mutate(confirmButton, () => api('/nodes/deduplicate-exit-ips', {method:'POST', body:{confirm:true}}), '已剔除 ' + duplicateCount + ' 个重复出口节点'));
-      } catch (error) { toast(error.message, 'error'); }
-      finally { busy(button, false); }
     }
 
     async function showAccounts(node, button) {
@@ -626,6 +673,15 @@
     });
     $('node-search').addEventListener('input', (event) => { state.search = event.target.value; renderNodes(); });
     $('add-node').addEventListener('click', () => openNode());
+    $('bulk-add-node').addEventListener('click', () => openModal('bulk-node-modal'));
+    $('bulk-node-input').addEventListener('input', (event) => {
+      try {
+        const count = parseBulkNodes(event.target.value).length;
+        $('bulk-node-summary').textContent = '已识别 ' + count + ' 个节点；保存后代理 URL 不会回显';
+      } catch (error) {
+        $('bulk-node-summary').textContent = error.message;
+      }
+    });
     $('rebalance-nodes').addEventListener('click', async (event) => {
       const button = event.currentTarget;
       busy(button, true);
@@ -637,7 +693,6 @@
       } catch (error) { toast(error.message, 'error'); }
       finally { busy(button, false); }
     });
-    $('deduplicate-exit-ips').addEventListener('click', (event) => deduplicateExitIPs(event.currentTarget));
     $('edit-policy').addEventListener('click', openPolicy);
     $('select-all').addEventListener('change', (event) => {
       filteredNodes().forEach((node) => event.target.checked ? state.selected.add(node.id) : state.selected.delete(node.id)); renderNodes();
@@ -667,31 +722,38 @@
     });
     $('node-form').addEventListener('submit', async (event) => {
       event.preventDefault();
-      const button = $('save-node');
-      const proxyLines = $('node-proxy').value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      const button = $('save-node'); const proxyURL = $('node-proxy').value.trim();
       const body = {name:$('node-name').value.trim(),enabled:$('node-enabled').checked,proxyPool:$('node-pool').checked,accountCapacity:Number($('node-capacity').value || 0)};
-      if (state.editing) {
-        if (proxyLines.length > 1) { toast('编辑节点时只能填写一个代理 URL', 'error'); return; }
-        if (proxyLines[0]) body.proxyURL = proxyLines[0];
-        if (!body.name) { toast('请填写名称', 'error'); return; }
-      } else {
-        if (!body.name || !proxyLines.length) { toast('请填写名称和代理 URL', 'error'); return; }
-        body.proxyURLs = proxyLines;
-      }
+      if (proxyURL) body.proxyURL = proxyURL;
+      if (!body.name || (!state.editing && !proxyURL)) { toast('请填写名称和代理 URL', 'error'); return; }
       busy(button, true);
       try {
         const path = state.editing ? '/nodes/' + encodeURIComponent(state.editing.id) : '/nodes';
-        const result = await api(path, {method: state.editing ? 'PUT' : 'POST', body});
-        const created = Number(result?.created || result?.data?.total || proxyLines.length || 1);
-        toast(state.editing ? '节点已更新' : (created > 1 ? ('已批量添加 ' + created + ' 个节点') : '节点已添加'));
-        closeModal('node-modal'); await load(true);
+        await api(path, {method: state.editing ? 'PUT' : 'POST', body});
+        toast(state.editing ? '节点已更新' : '节点已添加'); closeModal('node-modal'); await load(true);
+      } catch (error) { toast(error.message, 'error'); }
+      finally { busy(button, false); }
+    });
+    $('bulk-node-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const button = $('import-nodes');
+      let items;
+      try { items = parseBulkNodes($('bulk-node-input').value); }
+      catch (error) { toast(error.message, 'error'); return; }
+      busy(button, true);
+      try {
+        const result = await api('/nodes/import', {method:'POST', body:{items}});
+        const created = Number(result.created ?? result.data?.created ?? items.length);
+        closeModal('bulk-node-modal');
+        toast('已导入 ' + created + ' 个节点');
+        await load(true);
       } catch (error) { toast(error.message, 'error'); }
       finally { busy(button, false); }
     });
     $('policy-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       const button = $('save-policy');
-      const body = {mode:$('policy-mode').value,activeIntervalSeconds:Number($('policy-active').value),passivePollSeconds:Number($('policy-passive').value),softTPS:Number($('policy-soft').value),hardTPS:Number($('policy-hard').value),consecutiveSoft:Number($('policy-soft-count').value),consecutiveErrors:Number($('policy-error-count').value),quarantineSeconds:Number($('policy-quarantine').value),minHealthyNodes:Number($('policy-min-healthy').value),http429AccountAction:$('policy-429-account-action').value,non429IsolationAction:$('policy-non429-isolation-action').value};
+      const body = {mode:$('policy-mode').value,activeIntervalSeconds:Number($('policy-active').value),passivePollSeconds:Number($('policy-passive').value),softTPS:Number($('policy-soft').value),hardTPS:Number($('policy-hard').value),consecutiveSoft:Number($('policy-soft-count').value),consecutiveErrors:Number($('policy-error-count').value),minGenerationMs:Number($('policy-min-generation').value),minOutputTokens:Number($('policy-min-output').value),maxOutputTokens:Number($('policy-max-output').value),model:$('policy-model').value.trim(),disableAuthOnHard:$('policy-disable-auth').checked,quarantineSeconds:Number($('policy-quarantine').value),minHealthyNodes:Number($('policy-min-healthy').value)};
       if (body.softTPS >= body.hardTPS) { toast('软阈值必须低于硬阈值', 'error'); return; }
       busy(button, true);
       try { await api('/quality-guard/config', {method:'PUT', body}); toast('守护策略已保存'); closeModal('policy-modal'); await load(true); }
@@ -700,7 +762,7 @@
     });
     document.addEventListener('click', (event) => { const close = event.target.closest('[data-close]'); if (close) closeModal(close.dataset.close); });
     $('confirm-action').addEventListener('click', () => { if (state.confirm) state.confirm($('confirm-action')); });
-    document.addEventListener('keydown', (event) => { if (event.key === 'Escape') ['node-modal','policy-modal','confirm-modal','accounts-modal'].forEach((id) => { if (!$(id).hidden) closeModal(id); }); });
+    document.addEventListener('keydown', (event) => { if (event.key === 'Escape') ['node-modal','bulk-node-modal','policy-modal','confirm-modal','accounts-modal'].forEach((id) => { if (!$(id).hidden) closeModal(id); }); });
     const savedTheme = localStorage.getItem('grok2api-egress-theme');
     document.documentElement.dataset.theme = savedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
     load();
