@@ -20,7 +20,10 @@
     .page-head > div:first-child { min-width: 0; }
     .page-head h1 { min-width: 0; margin: 0; font-family: var(--font-display); font-size: var(--text-xl); font-weight: 650; line-height: 1.2; overflow-wrap: anywhere; }
     .page-head p { margin: var(--space-3xs) 0 0; color: var(--muted-foreground); font-size: var(--text-xs); }
-    .head-actions, .toolbar, .row-actions, .modal-actions { display: flex; align-items: center; gap: var(--space-2xs); }
+    .head-actions, .toolbar, .row-actions, .modal-actions, .batch-actions { display: flex; align-items: center; gap: var(--space-2xs); }
+    .batch-actions { flex-wrap: wrap; }
+    .batch-bar { min-height: 3rem; display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm); padding: var(--space-2xs) var(--space-sm); border-bottom: var(--rule-hairline) solid var(--border); background: var(--muted); }
+    .batch-bar span { font-size: var(--text-xs); color: var(--muted-foreground); }
     .status-line { display: inline-flex; align-items: center; gap: var(--space-2xs); color: var(--muted-foreground); font-size: var(--text-xs); }
     .status-dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--muted-foreground); }
     .status-dot.good { background: var(--success); }
@@ -63,6 +66,17 @@
     td { font-size: var(--text-xs); }
     tbody tr:last-child td { border-bottom: 0; }
     tbody tr:hover td { background: color-mix(in oklch, var(--secondary) 55%, transparent); }
+    .check-cell { width: 2.5rem; text-align: center; }
+    .row-actions { justify-content: flex-end; flex-wrap: wrap; }
+    .row-actions .button { min-height: 2rem; padding: 0 var(--space-2xs); }
+    th.actions-col, td.actions-col {
+      position: sticky; right: 0; z-index: 2;
+      background: var(--card);
+      box-shadow: -8px 0 12px -12px oklch(0 0 0 / 0.35);
+      text-align: right;
+      min-width: 7rem;
+    }
+    tbody tr:hover td.actions-col { background: color-mix(in oklch, var(--secondary) 55%, var(--card)); }
     .account-name { max-width: 20rem; font-weight: 620; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .subtext { margin-top: var(--space-3xs); color: var(--muted-foreground); font-size: var(--text-2xs); overflow-wrap: anywhere; max-width: 24rem; }
     .numeric { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
@@ -179,12 +193,20 @@
           <input id="account-search" class="search" type="search" placeholder="搜索账号或邮箱" aria-label="搜索账号">
         </div>
       </div>
+      <div id="batch-bar" class="batch-bar" hidden>
+        <span id="batch-count">已选择 0 个账号</span>
+        <div class="batch-actions">
+          <button id="batch-quality" class="button primary" type="button">批量质量检测</button>
+          <button id="batch-clear" class="button ghost" type="button">取消选择</button>
+        </div>
+      </div>
       <div class="table-wrap desktop-table">
         <table>
           <thead><tr>
-            <th>账号</th><th>状态</th><th>分类</th><th class="numeric">Token/s</th><th class="numeric">软/失败计数</th><th>动作</th><th>最近观测</th><th>原因</th>
+            <th class="check-cell"><input id="select-all" type="checkbox" aria-label="选择所有账号"></th>
+            <th>账号</th><th>状态</th><th>分类</th><th class="numeric">Token/s</th><th class="numeric">软/失败计数</th><th>动作</th><th>最近观测</th><th>原因</th><th class="actions-col">操作</th>
           </tr></thead>
-          <tbody id="accounts-body"><tr><td colspan="8" class="loading">正在加载账号</td></tr></tbody>
+          <tbody id="accounts-body"><tr><td colspan="10" class="loading">正在加载账号</td></tr></tbody>
         </table>
       </div>
       <div id="account-cards" class="account-cards" aria-label="账号卡片"></div>
@@ -197,7 +219,7 @@
 
     <div class="lower-grid">
       <section class="section" aria-labelledby="events-title">
-        <div class="section-head"><div><h2 id="events-title">最近事件</h2><p>停用、删除、抑制与观测模式记录</p></div></div>
+        <div class="section-head"><div><h2 id="events-title">最近事件</h2><p>观测、停用、删除、抑制与观测模式记录（保留最近 100 条）</p></div><label class="status-line"><input id="events-actions-only" type="checkbox" style="width:1rem"> 只看动作</label></div>
         <div id="events-list" class="events"><div class="loading">正在加载事件</div></div>
       </section>
       <section class="section" aria-labelledby="policy-title">
@@ -221,6 +243,8 @@
           <div class="field"><label for="policy-hard-action">硬阈值动作</label><select id="policy-hard-action"><option value="disable">停用账号</option><option value="delete">删除账号</option><option value="none">不处理</option></select><small>硬阈值单次命中立即执行</small></div>
           <div class="field"><label for="policy-fail-action">连续失败动作</label><select id="policy-fail-action"><option value="disable">停用账号</option><option value="delete">删除账号</option><option value="none">不处理</option></select></div>
           <div class="field"><label for="policy-min-keep">最低保留账号数</label><input id="policy-min-keep" type="number" min="0" max="10000" required><small>执行后启用账号数低于该值时抑制动作</small></div>
+          <div class="field"><label for="policy-probe-model">探测模型</label><input id="policy-probe-model" type="text" maxlength="120" placeholder="grok-4.5"><small>手动质量检测使用的模型</small></div>
+          <div class="field"><label for="policy-probe-tokens">探测最大输出 token</label><input id="policy-probe-tokens" type="number" min="32" max="8192"><small>越大越准，但更慢更贵</small></div>
           <div class="field full check-row"><div><label for="policy-dry-run">观测模式（dry-run）</label><p class="help">只记录「将执行」事件，不实际停用或删除</p></div><input id="policy-dry-run" type="checkbox"></div>
         </div>
         <div class="modal-actions"><button class="button" type="button" data-close="policy-modal">取消</button><button id="save-policy" class="button primary" type="submit">保存策略</button></div>
@@ -234,7 +258,11 @@
   (() => {
     'use strict';
     const MANAGEMENT_API = '/v0/management/grok2api-account-guard/api';
-    const state = { status: null, accounts: [], search: '', loading: false, autoTimer: 0 };
+    // Backend caps one quality-test request; chunk larger selections so no
+    // single management request runs long.
+    const PROBE_CHUNK = 5;
+    const ACTION_EVENTS = new Set(['account_disabled','account_deleted','action_suppressed','dry_run_would_act','account_delete_skipped','account_disable_failed','action_none','account_action_cleared']);
+    const state = { status: null, accounts: [], selected: new Set(), search: '', actionsOnly: false, loading: false, probing: false, autoTimer: 0 };
     const $ = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
     const number = (value) => new Intl.NumberFormat('zh-CN').format(Number(value || 0));
@@ -243,6 +271,7 @@
     const classificationTone = (value) => ({healthy:'good', soft:'warn', hard:'bad', failed:'bad'})[value] || 'muted';
     const actedName = (value) => ({disabled:'已停用', deleted:'已删除'})[value] || '';
     const eventName = (value) => ({
+      account_observed:'观测',
       account_disabled:'账号已停用',
       account_deleted:'账号已删除',
       action_suppressed:'动作已抑制',
@@ -253,6 +282,8 @@
       account_action_cleared:'已清除动作标记',
       usage_unmapped:'usage 未映射账号'
     })[value] || value;
+    const observationLabel = (classification) => ({healthy:'健康观测', soft:'软阈值观测', hard:'硬阈值观测', failed:'失败观测'})[classification] || '观测';
+    const sourceName = (value) => ({passive:'被动', probe:'主动探测'})[value] || '';
     const relative = (epoch) => {
       if (!epoch) return '-';
       const sec = Math.max(0, Math.round(Date.now() / 1000 - Number(epoch)));
@@ -329,11 +360,13 @@
         const status = await api('/status');
         state.status = status;
         state.accounts = Array.isArray(status.accounts) ? status.accounts : [];
+        // Drop selections whose account is gone (deleted by the guard).
+        state.selected = new Set([...state.selected].filter((key) => state.accounts.some((a) => a.key === key && a.present)));
         render();
         setService(true, '账号守护运行中');
       } catch (error) {
         setService(false, '连接失败');
-        $('accounts-body').innerHTML = '<tr><td colspan="8" class="error-state">' + esc(error.message) + '</td></tr>';
+        $('accounts-body').innerHTML = '<tr><td colspan="10" class="error-state">' + esc(error.message) + '</td></tr>';
         if (!silent) toast(error.message, 'error');
       } finally {
         state.loading = false;
@@ -379,14 +412,20 @@
       const items = filteredAccounts();
       const body = $('accounts-body');
       const cards = $('account-cards');
+      renderBatchBar();
       if (!items.length) {
-        body.innerHTML = '<tr><td colspan="8" class="empty">没有账号观测数据</td></tr>';
+        body.innerHTML = '<tr><td colspan="10" class="empty">没有账号观测数据</td></tr>';
         cards.innerHTML = '<div class="empty">没有账号观测数据</div>';
         return;
       }
+      const probeCell = (account) => account.present
+        ? '<button class="button" type="button" data-quality="' + esc(account.key) + '">质量</button>'
+        : '<span class="badge muted">不可检测</span>';
       body.innerHTML = items.map((account) => {
         const tone = classificationTone(account.last_classification);
+        const checked = state.selected.has(account.key) ? ' checked' : '';
         return '<tr>'
+          + '<td class="check-cell">' + (account.present ? '<input type="checkbox" data-select="' + esc(account.key) + '"' + checked + ' aria-label="选择账号">' : '') + '</td>'
           + '<td><div class="account-name">' + esc(account.name || account.key) + '</div>'
           + (account.email ? '<div class="subtext">' + esc(account.email) + '</div>' : '') + '</td>'
           + '<td>' + accountStatusBadges(account) + '</td>'
@@ -394,8 +433,10 @@
           + '<td class="numeric">' + (account.last_output_tps ? Number(account.last_output_tps).toFixed(1) : '-') + '</td>'
           + '<td class="numeric">' + number(account.soft_strikes) + ' / ' + number(account.fail_strikes) + '</td>'
           + '<td>' + (account.action ? '<span class="badge bad">' + esc(actedName(account.action)) + '</span>' : '<span class="badge muted">未处理</span>') + '</td>'
-          + '<td>' + esc(relative(account.last_observed_at)) + '<div class="subtext">共 ' + number(account.observed_count) + ' 次</div></td>'
+          + '<td>' + esc(relative(account.last_observed_at))
+          + '<div class="subtext">共 ' + number(account.observed_count) + ' 次' + (account.last_source ? ' · ' + esc(sourceName(account.last_source)) : '') + '</div></td>'
           + '<td><div class="subtext">' + esc(account.reason || '-') + '</div></td>'
+          + '<td class="actions-col"><div class="row-actions">' + probeCell(account) + '</div></td>'
           + '</tr>';
       }).join('');
       cards.innerHTML = items.map((account) => {
@@ -413,8 +454,45 @@
           + '<div>观测次数<strong>' + number(account.observed_count) + '</strong></div>'
           + '</div>'
           + (account.reason ? '<div class="subtext">' + esc(account.reason) + '</div>' : '')
+          + '<div class="row-actions">' + probeCell(account) + '</div>'
           + '</article>';
       }).join('');
+    }
+    function renderBatchBar() {
+      const count = state.selected.size;
+      $('batch-bar').hidden = count === 0;
+      $('batch-count').textContent = '已选择 ' + count + ' 个账号';
+      const all = filteredAccounts().filter((a) => a.present);
+      $('select-all').checked = all.length > 0 && all.every((a) => state.selected.has(a.key));
+    }
+    function toggleSelect(key, on) {
+      if (on) state.selected.add(key); else state.selected.delete(key);
+      renderBatchBar();
+    }
+    async function runQualityTest(keys, trigger) {
+      if (state.probing || !keys.length) return;
+      state.probing = true;
+      busy(trigger, true);
+      const summary = {healthy:0, soft:0, hard:0, failed:0};
+      try {
+        for (let i = 0; i < keys.length; i += PROBE_CHUNK) {
+          const chunk = keys.slice(i, i + PROBE_CHUNK);
+          const payload = await api('/accounts/quality-test', {method: 'POST', body: {keys: chunk}});
+          const results = payload.results || payload.data?.results || [];
+          for (const r of results) {
+            const bucket = r.error ? 'failed' : (r.classification || 'failed');
+            if (bucket in summary) summary[bucket] += 1; else summary.failed += 1;
+          }
+        }
+        toast('检测完成 · 健康 ' + summary.healthy + ' · 软 ' + summary.soft + ' · 硬 ' + summary.hard + ' · 失败 ' + summary.failed,
+          (summary.hard || summary.failed) ? 'error' : 'success');
+        await load(true);
+      } catch (error) {
+        toast(error.message, 'error');
+      } finally {
+        state.probing = false;
+        busy(trigger, false);
+      }
     }
     function renderStatistics() {
       const stats = state.status?.statistics || {};
@@ -438,16 +516,18 @@
         + '<div class="stat">输出 Token<strong>' + number(obs.output_tokens) + '</strong><small>累计观测到的输出量</small></div>';
     }
     function renderEvents() {
-      const events = (state.status?.recentEvents || []).slice().reverse();
+      let events = (state.status?.recentEvents || []).slice().reverse();
+      if (state.actionsOnly) events = events.filter((event) => ACTION_EVENTS.has(event.event));
       const list = $('events-list');
       if (!events.length) {
-        list.innerHTML = '<div class="empty">还没有事件</div>';
+        list.innerHTML = '<div class="empty">' + (state.actionsOnly ? '还没有动作记录' : '还没有事件') + '</div>';
         return;
       }
       list.innerHTML = events.map((event) => {
-        const label = eventName(event.event);
+        const label = event.event === 'account_observed' ? observationLabel(event.classification) : eventName(event.event);
         const who = event.account_name || event.account_key || '';
         const bits = [];
+        if (event.source) bits.push(sourceName(event.source));
         if (event.tier) bits.push(({soft:'软阈值', hard:'硬阈值', fail:'连续失败'})[event.tier] || event.tier);
         if (event.action) bits.push(actionName(event.action));
         if (event.output_tps) bits.push(Number(event.output_tps).toFixed(1) + ' Token/s');
@@ -469,6 +549,7 @@
         ['连续失败动作', actionName(config.fail_action)],
         ['最低保留账号数', config.min_keep_accounts],
         ['观测模式', config.dry_run ? '开启' : '关闭'],
+        ['探测模型', config.probe_model],
       ];
       $('policy-view').innerHTML = rows.map(([label, value]) =>
         '<div><dt>' + esc(label) + '</dt><dd>' + esc(value ?? '-') + '</dd></div>'
@@ -484,6 +565,8 @@
       $('policy-hard-action').value = config.hard_action || 'delete';
       $('policy-fail-action').value = config.fail_action || 'disable';
       $('policy-min-keep').value = config.min_keep_accounts ?? 2;
+      $('policy-probe-model').value = config.probe_model || 'grok-4.5';
+      $('policy-probe-tokens').value = config.probe_max_tokens ?? 384;
       $('policy-dry-run').checked = Boolean(config.dry_run);
       $('policy-error').hidden = true;
       $('policy-modal').hidden = false;
@@ -499,6 +582,8 @@
         hard_action: $('policy-hard-action').value,
         fail_action: $('policy-fail-action').value,
         min_keep_accounts: Number($('policy-min-keep').value),
+        probe_model: $('policy-probe-model').value,
+        probe_max_tokens: Number($('policy-probe-tokens').value),
         dry_run: $('policy-dry-run').checked
       };
       busy($('save-policy'), true);
@@ -524,10 +609,28 @@
       $('edit-policy').addEventListener('click', openPolicy);
       $('policy-form').addEventListener('submit', savePolicy);
       $('account-search').addEventListener('input', (event) => { state.search = event.target.value; renderAccounts(); });
+      $('events-actions-only').addEventListener('change', (event) => { state.actionsOnly = event.target.checked; renderEvents(); });
+      $('select-all').addEventListener('change', (event) => {
+        for (const account of filteredAccounts()) {
+          if (!account.present) continue;
+          if (event.target.checked) state.selected.add(account.key); else state.selected.delete(account.key);
+        }
+        renderAccounts();
+      });
+      $('batch-clear').addEventListener('click', () => { state.selected.clear(); renderAccounts(); });
+      $('batch-quality').addEventListener('click', (event) => {
+        runQualityTest([...state.selected], event.currentTarget);
+      });
       $('theme-button').addEventListener('click', () => {
         applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
       });
+      document.addEventListener('change', (event) => {
+        const box = event.target.closest('[data-select]');
+        if (box) toggleSelect(box.dataset.select, box.checked);
+      });
       document.addEventListener('click', (event) => {
+        const probe = event.target.closest('[data-quality]');
+        if (probe) { runQualityTest([probe.dataset.quality], probe); return; }
         const close = event.target.closest('[data-close]');
         if (close) $(close.dataset.close).hidden = true;
       });
@@ -542,7 +645,7 @@
     } catch (_) {}
     bind();
     load();
-    state.autoTimer = window.setInterval(() => load(true), 15000);
+    state.autoTimer = window.setInterval(() => { if (!state.probing) load(true); }, 15000);
   })();
   </script>
 </body>

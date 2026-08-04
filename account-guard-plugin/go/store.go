@@ -31,6 +31,18 @@ const (
 	actedDeleted  = "deleted"
 )
 
+// Observation sources.
+const (
+	sourcePassive = "passive"
+	sourceProbe   = "probe"
+)
+
+// Active quality probe defaults.
+const (
+	defaultProbeModel     = "grok-4.5"
+	defaultProbeMaxTokens = 384
+)
+
 type policyConfig struct {
 	SoftTPS         float64 `json:"soft_tps"`
 	HardTPS         float64 `json:"hard_tps"`
@@ -41,6 +53,8 @@ type policyConfig struct {
 	FailAction      string  `json:"fail_action"`
 	MinKeepAccounts int     `json:"min_keep_accounts"`
 	DryRun          bool    `json:"dry_run"`
+	ProbeModel      string  `json:"probe_model"`
+	ProbeMaxTokens  int     `json:"probe_max_tokens"`
 }
 
 type accountRecord struct {
@@ -56,6 +70,7 @@ type accountRecord struct {
 	LastDurationMs     int64   `json:"last_duration_ms,omitempty"`
 	LastFirstTokenMs   int64   `json:"last_first_token_ms,omitempty"`
 	LastObservedAt     float64 `json:"last_observed_at,omitempty"`
+	LastSource         string  `json:"last_source,omitempty"`
 	ObservedCount      int64   `json:"observed_count"`
 	Action             string  `json:"action,omitempty"`
 	ActedAt            float64 `json:"acted_at,omitempty"`
@@ -72,6 +87,7 @@ type guardEvent struct {
 	Action         string  `json:"action,omitempty"`
 	Classification string  `json:"classification,omitempty"`
 	OutputTPS      float64 `json:"output_tps,omitempty"`
+	Source         string  `json:"source,omitempty"`
 	Reason         string  `json:"reason,omitempty"`
 	DryRun         bool    `json:"dry_run,omitempty"`
 }
@@ -125,6 +141,8 @@ func defaultPolicy() policyConfig {
 		FailAction:      accountActionDisable,
 		MinKeepAccounts: 2,
 		DryRun:          false,
+		ProbeModel:      defaultProbeModel,
+		ProbeMaxTokens:  defaultProbeMaxTokens,
 	}
 }
 
@@ -186,6 +204,12 @@ func (s *stateStore) load() error {
 	}
 	if data.Policy.MinKeepAccounts < 0 {
 		data.Policy.MinKeepAccounts = 0
+	}
+	if strings.TrimSpace(data.Policy.ProbeModel) == "" {
+		data.Policy.ProbeModel = defaultProbeModel
+	}
+	if data.Policy.ProbeMaxTokens <= 0 {
+		data.Policy.ProbeMaxTokens = defaultProbeMaxTokens
 	}
 	s.data = data
 	return nil
@@ -255,6 +279,13 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 	}
 	if p.MinKeepAccounts < 0 {
 		p.MinKeepAccounts = 0
+	}
+	p.ProbeModel = strings.TrimSpace(p.ProbeModel)
+	if p.ProbeModel == "" {
+		p.ProbeModel = defaultProbeModel
+	}
+	if p.ProbeMaxTokens <= 0 {
+		p.ProbeMaxTokens = defaultProbeMaxTokens
 	}
 	s.data.Policy = p
 	return s.persistLocked()

@@ -1,7 +1,7 @@
 # grok2api-account-guard
 
-> 纯 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) 原生插件：**被动、以账号为中心**的质量守护 —— 盯住每个账号的输出 Token/s 与失败情况，命中阈值就自动停用或删除该账号。
-> **零出口节点配置** —— 不需要 proxy_url、不做迁号、不做主动探测。
+> 纯 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) 原生插件：**以账号为中心**的质量守护 —— 盯住每个账号的输出 Token/s 与失败情况，命中阈值就自动停用或删除该账号。
+> **零出口节点配置** —— 不需要 proxy_url、不做迁号、无后台 worker。
 
 | | |
 |---|---|
@@ -25,10 +25,11 @@
 
 本插件就只做这一件事：
 
-- 订阅 CPA usage hook，**仅在账号被实际调用时**评估它
+- 订阅 CPA usage hook，**在账号被实际调用时**自动评估它
 - 用与 egress 插件相同的判定语义（`computeTPS` / `classifyTPS`，**Token/s 越高越差**）
 - 命中软 / 硬 / 连续失败三档中任意一档 → 执行该档配置的动作（停用 / 删除 / 不处理）
-- 无节点、无 `proxy_url`、无主动探测、无后台 worker
+- 需要时可在界面**手动**对单个/多个账号发起质量检测，结果同样进入判定
+- 无节点、无 `proxy_url` 调度、无定时任务
 
 ---
 
@@ -179,6 +180,8 @@ state_file: /CLIProxyAPI/plugin-data/account-guard/state.json
 | `fail_action` | enum | `disable` | `disable` / `delete` / `none` |
 | `min_keep_accounts` | int | `2` | 最低保留启用账号数；`0` 关闭安全阀 |
 | `dry_run` | bool | `false` | 观测模式：只记录不执行 |
+| `probe_model` | string | `grok-4.5` | 手动质量检测使用的模型 |
+| `probe_max_tokens` | int | `384` | 手动质量检测的最大输出 token |
 
 校验规则：`soft_tps` 与 `hard_tps` 均须大于 0 且 `soft_tps < hard_tps`；三档 action 必须是 `disable` / `delete` / `none` 之一。非法提交会被拒绝并返回错误，**原策略保持不变**。
 
@@ -189,9 +192,9 @@ state_file: /CLIProxyAPI/plugin-data/account-guard/state.json
 菜单名：**账号守护** · 路径：CPA 管理台 → 插件资源 `/status`
 
 - 概览指标：守护状态、可用账号数、已处理账号数、执行/观测模式
-- **账号表**：每账号的分类、Token/s、软/失败计数、动作、原因、最近观测时间与观测次数
-- 策略表单：三档阈值与动作下拉、连续次数、最低保留账号数、观测模式开关（校验错误就地显示）
-- 事件流 + 观测统计面板
+- **账号表**：每账号的分类、Token/s、软/失败计数、动作、原因、最近观测时间与观测次数；每行「质量」按钮，多选支持批量检测
+- 策略表单：三档阈值与动作下拉、连续次数、最低保留账号数、观测模式开关、探测模型与最大 token（校验错误就地显示）
+- 事件流（含「只看动作」过滤）+ 观测统计面板
 
 UI 经 management 代理，请求头需 `X-Grok2API-Account-Guard-UI: 1`（页面已内置）。
 
@@ -199,6 +202,7 @@ UI 经 management 代理，请求头需 `X-Grok2API-Account-Guard-UI: 1`（页�
 
 | 事件 | 含义 |
 |---|---|
+| `account_observed` | 一次观测（含 healthy），带分类、Token/s、来源与 strike 进度 |
 | `account_disabled` | 账号已停用 |
 | `account_deleted` | 账号已删除 |
 | `action_suppressed` | 安全阀抑制了动作 |
@@ -209,7 +213,38 @@ UI 经 management 代理，请求头需 `X-Grok2API-Account-Guard-UI: 1`（页�
 | `account_action_cleared` | 账号已恢复启用，清除历史动作标记 |
 | `usage_unmapped` | usage 事件无法定位到账号 |
 
-事件保留最近 **100** 条（环形缓冲，随状态文件持久化）。
+事件保留最近 **100** 条（环形缓冲，随状态文件持久化）。每条事件带 `source` 字段区分 `passive`（被动 usage）与 `probe`（主动探测）。
+
+> ⚠️ **观测事件会挤占动作记录。** 由于每一次调用都会写一条 `account_observed`，高流量下 100 条缓冲几分钟就轮空，停用/删除记录会被挤掉。管理台事件面板右上角提供 **「只看动作」** 勾选框，过滤掉观测噪声。若需要长期审计，请从状态文件外部采集。
+
+---
+
+## 手动质量检测
+
+账号列表每行有 **「质量」** 按钮；勾选多个账号后可用顶部的 **「批量质量检测」**。
+
+检测行为：
+
+- 用**该账号自己的** `access_token` 与 `base_url` 发一次真实的流式补全（默认 `grok-4.5`，384 token）
+- 账号若配置了 `proxy_url` 就经该代理发出，否则直连
+- 测出输出 Token/s，按与被动观测**完全相同**的阈值分类，同样应用小输出保护
+
+**结果会参与守护判定**：
+
+| 探测结果 | 后果 |
+|---|---|
+| `healthy` | 清零 soft/fail 计数 |
+| `soft` | soft 计数 +1，达到 `consecutive_soft` → 执行 `soft_action` |
+| `hard` | **立即**执行 `hard_action` |
+| 探测失败（上游错误 / 无输出 / 缺 token） | 计为一次失败，fail 计数 +1，达到 `consecutive_fail` → 执行 `fail_action` |
+
+安全阀 `min_keep_accounts` 与 `dry_run` 对手动检测**同样生效**。
+
+> ⚠️ **批量检测可能一次删掉多个账号。** 若某出口整体降智，批量检测会让每个账号都判定为 `hard`，在 `hard_action = delete` 下会连续删除，直到安全阀拦住（保留 `min_keep_accounts` 个）。首次使用建议先开 `dry_run`，或把 `hard_action` 改成 `disable`。
+
+> **没有定时探测。** 检测只在你点按钮时发生，插件仍然没有后台 worker。
+
+**批量分片**：单次管理请求最多检测 5 个账号（`maxProbeBatch`），界面会把更大的选择自动分片串行发送，避免单个请求长时间阻塞。每次探测超时 90 秒。
 
 ---
 
@@ -220,10 +255,10 @@ UI 经 management 代理，请求头需 `X-Grok2API-Account-Guard-UI: 1`（页�
 | | `grok2api-egress` | `grok2api-account-guard` |
 |---|---|---|
 | 中心概念 | 出口节点（proxy_url） | 账号 |
-| 判定来源 | 被动 usage + **主动探测** | **仅**被动 usage |
+| 判定来源 | 被动 usage + **主动探测** | 被动 usage + **手动**探测 |
 | 动作对象 | 节点（隔离）+ 账号（迁移/删除） | 账号（停用/删除） |
 | 需要配置节点 | ✅ 必须 | ❌ 不需要 |
-| 覆盖闲置账号 | ✅ 主动探测能覆盖 | ❌ 没流量就不评估 |
+| 覆盖闲置账号 | ✅ 定时主动探测 | ⚠️ 需人工点「质量」检测 |
 | 自动恢复 | ✅ 复测通过后恢复 | ❌ 需人工启用 |
 
 ### ⚠️ 同时启用的注意事项
@@ -251,7 +286,8 @@ account-guard-plugin/
     ├── main.go        # CGO ABI、注册、Management/Usage 入口、API 路由
     ├── store.go       # state.json 读写、策略校验、账号记录、事件、统计
     ├── auth.go        # list/get/save auth、安全删除守卫、启用账号计数
-    ├── guard.go       # TPS 计算与分类、字段抽取、strikes 计数、安全阀、动作
+    ├── guard.go       # TPS 计算与分类、字段抽取、观测管线、strikes、安全阀、动作
+    ├── probe.go       # 手动质量检测（真实流式补全、SSE 解析、批量）
     ├── page.html      # 管理 UI（go:embed）
     ├── tokens.css     # 设计 token（go:embed）
     ├── main_test.go
@@ -315,7 +351,8 @@ state_file: /CLIProxyAPI/plugin-data/account-guard/state.json
 
 ## 已知边界
 
-- **闲置账号永不被评估**：纯被动语义的必然结果。需要主动覆盖请用 `grok2api-egress`。
+- **闲置账号不会被自动评估**：被动语义的必然结果。可以人工点「质量」按钮补测，或用 `grok2api-egress` 的定时主动探测。
 - **strikes 不随时间衰减**：很久以前的一次 `soft` 会一直留在计数里，直到该账号下次被观测为 `healthy` 才清零。
-- **不区分失败原因**：被动 usage 记录不含 HTTP 状态码，只有 `failed` 布尔值，所以 429 / 5xx / 网络错误一视同仁。
+- **不区分失败原因**：被动 usage 记录不含 HTTP 状态码，只有 `failed` 布尔值，所以 429 / 5xx / 网络错误一视同仁。手动探测能拿到状态码，但也只记进错误文本，不改变判定。
 - **删除仅对本地文件生效**：非文件型凭据会被删除守卫拒绝并记 `account_delete_skipped`。
+- **观测事件挤占动作记录**：见上文事件类型小节；用「只看动作」过滤。

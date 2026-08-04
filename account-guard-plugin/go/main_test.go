@@ -523,6 +523,16 @@ func TestRenderStatusPage(t *testing.T) {
 		"观测模式",
 		"最低保留账号数",
 		"/v0/management/grok2api-account-guard/api",
+		// quality probe controls
+		"data-quality=",
+		"batch-quality",
+		"select-all",
+		"/accounts/quality-test",
+		"policy-probe-model",
+		"policy-probe-tokens",
+		// event stream additions
+		"account_observed",
+		"events-actions-only",
 	} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("missing %q", want)
@@ -536,5 +546,170 @@ func TestRenderStatusPage(t *testing.T) {
 		if strings.Contains(page, unwanted) {
 			t.Fatalf("unexpected egress identifier %q in account-guard page", unwanted)
 		}
+	}
+}
+
+// --- 主动质量探测 ---
+
+func stubProbe(t *testing.T, res probeResult) {
+	t.Helper()
+	orig := probeAccountQualityFn
+	t.Cleanup(func() { probeAccountQualityFn = orig })
+	probeAccountQualityFn = func(policyConfig, authFile) probeResult { return res }
+}
+
+func stubAuthList(t *testing.T, auths ...authFile) {
+	t.Helper()
+	orig := listAllAuths
+	t.Cleanup(func() { listAllAuths = orig })
+	listAllAuths = func() ([]authFile, error) { return auths, nil }
+}
+
+func TestRunQualityProbesResolvesKeysAndActs(t *testing.T) {
+	s := newTestStore(t, func(p *policyConfig) {
+		p.HardAction = accountActionDelete
+		p.MinKeepAccounts = 0
+	})
+	h := newFakeHost(t, "xai-test.json", 5)
+	stubAuthList(t, h.auth)
+	stubProbe(t, probeResult{Classification: tierHard, TPS: 1240, OutputTokens: 400, DurationMs: 322})
+
+	results, err := runQualityProbes(s, []string{"name:xai-test.json", "name:missing.json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %d, want 2", len(results))
+	}
+	if results[0].Classification != tierHard || results[0].Name != "xai-test.json" {
+		t.Fatalf("unexpected probe result: %#v", results[0])
+	}
+	if results[1].Error == "" {
+		t.Fatalf("unknown key must report an error: %#v", results[1])
+	}
+	if len(h.deleted) != 1 {
+		t.Fatalf("hard probe result must trigger the policy, deleted=%v", h.deleted)
+	}
+}
+func TestProbeObservationFeedsGuard(t *testing.T) {
+	s := newTestStore(t, func(p *policyConfig) {
+		p.HardAction = accountActionDelete
+		p.MinKeepAccounts = 0
+	})
+	h := newFakeHost(t, "xai-test.json", 5)
+
+	applyObservation(s, h.auth, observation{
+		Classification: tierHard,
+		TPS:            1240,
+		OutputTokens:   400,
+		DurationMs:     322,
+		Source:         sourceProbe,
+	})
+	if len(h.deleted) != 1 {
+		t.Fatalf("probe hard result must act like a passive one, deleted=%v", h.deleted)
+	}
+	rec, _ := s.getAccount("name:xai-test.json")
+	if rec == nil || rec.LastSource != sourceProbe {
+		t.Fatalf("probe source not recorded: %#v", rec)
+	}
+	found := false
+	for _, e := range s.events() {
+		if e.Event == "account_deleted" && e.Source == sourceProbe {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("action event must carry the probe source, events=%#v", s.events())
+	}
+}
+
+func TestProbeErrorCountsAsFailure(t *testing.T) {
+	s := newTestStore(t, func(p *policyConfig) {
+		p.ConsecutiveFail = 2
+		p.FailAction = accountActionDisable
+		p.MinKeepAccounts = 0
+	})
+	h := newFakeHost(t, "xai-test.json", 5)
+
+	for i := 0; i < 2; i++ {
+		applyObservation(s, h.auth, observation{
+			Classification: "failed",
+			Failed:         true,
+			Source:         sourceProbe,
+			Detail:         "主动探测失败: 上游 HTTP 401",
+		})
+	}
+	if len(h.disabled) != 1 {
+		t.Fatalf("two failed probes must disable, disabled=%v", h.disabled)
+	}
+}
+
+func TestProbeClassifiesAndGuardsSmallOutput(t *testing.T) {
+	pol := defaultPolicy()
+	pol.SoftTPS = 50
+	pol.HardTPS = 100
+	// The probe applies the same small-output guard as the passive path.
+	if got := classifyTPS(computeTPS(31, 200, 0), pol.SoftTPS, pol.HardTPS); got != tierHard {
+		t.Fatalf("precondition: raw classification = %q, want hard", got)
+	}
+	class, tps := classifyObservation(pol, usageObservation{OutputTokens: 31, DurationMs: 200})
+	if class != "healthy" || tps != 0 {
+		t.Fatalf("small output must be downgraded, got %q/%v", class, tps)
+	}
+}
+
+func TestProbeDefaultsInPolicy(t *testing.T) {
+	p := defaultPolicy()
+	if p.ProbeModel != defaultProbeModel || p.ProbeMaxTokens != defaultProbeMaxTokens {
+		t.Fatalf("probe defaults = %q/%d", p.ProbeModel, p.ProbeMaxTokens)
+	}
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	bad := s.policy()
+	bad.ProbeModel = "   "
+	bad.ProbeMaxTokens = -1
+	if err := s.updatePolicy(bad); err != nil {
+		t.Fatal(err)
+	}
+	got := s.policy()
+	if got.ProbeModel != defaultProbeModel || got.ProbeMaxTokens != defaultProbeMaxTokens {
+		t.Fatalf("blank probe settings must fall back to defaults: %#v", got)
+	}
+}
+
+// --- 观测事件流 ---
+
+func TestEveryObservationEmitsAnEvent(t *testing.T) {
+	s := newTestStore(t, func(p *policyConfig) { p.MinKeepAccounts = 0 })
+	newFakeHost(t, "xai-test.json", 5)
+
+	handleAccountUsage(s, usageRecord(100, 1000, 0, false)) // healthy — the 307 Token/s case
+	events := s.events()
+	if len(events) != 1 {
+		t.Fatalf("healthy observation must be recorded, events=%#v", events)
+	}
+	ev := events[0]
+	if ev.Event != "account_observed" || ev.Classification != "healthy" || ev.Source != sourcePassive {
+		t.Fatalf("unexpected observation event: %#v", ev)
+	}
+	if ev.AccountName != "xai-test.json" || ev.OutputTPS != 100 {
+		t.Fatalf("observation event missing detail: %#v", ev)
+	}
+}
+
+func TestSoftObservationEventShowsStrikeProgress(t *testing.T) {
+	s := newTestStore(t, func(p *policyConfig) {
+		p.ConsecutiveSoft = 3
+		p.MinKeepAccounts = 0
+	})
+	newFakeHost(t, "xai-test.json", 5)
+
+	handleAccountUsage(s, usageRecord(600, 1000, 0, false))
+	events := s.events()
+	last := events[len(events)-1]
+	if last.Classification != tierSoft {
+		t.Fatalf("expected soft observation, got %#v", last)
+	}
+	if !strings.Contains(last.Reason, "1/3") {
+		t.Fatalf("soft observation must show strike progress, reason=%q", last.Reason)
 	}
 }

@@ -13,6 +13,7 @@ import (
 var (
 	lookupAccount   = resolveUsageAccount
 	enabledAccounts = countEnabledAccounts
+	listAllAuths    = listAuthFiles
 	disableAccount  = func(a authFile, reason string) error {
 		// Keep the existing proxy binding; this plugin never touches egress.
 		return setAuthProxyAndFlags(a, a.ProxyURL, true, reason)
@@ -176,23 +177,52 @@ func actionForTier(pol policyConfig, tier string) string {
 	}
 }
 
-// handleAccountUsage is the whole passive pipeline: locate the account,
-// classify the call, update strikes, and act when a tier trips.
+// observation is one graded sample of an account, from either the passive
+// usage hook or an active quality probe. Both feed the same guard pipeline.
+type observation struct {
+	Classification string
+	TPS            float64
+	OutputTokens   int64
+	DurationMs     int64
+	FirstTokenMs   int64
+	Failed         bool
+	Source         string
+	Detail         string
+}
+
+// handleAccountUsage is the passive entry point: locate the account, grade the
+// call, then hand it to the shared pipeline.
 func handleAccountUsage(store *stateStore, record map[string]any) {
 	pol := store.policy()
-	obs := extractUsageFields(record)
+	usage := extractUsageFields(record)
 
-	auth, ok := lookupAccount(obs)
+	auth, ok := lookupAccount(usage)
 	if !ok {
 		store.bumpUnmapped()
 		store.appendEvent(guardEvent{
 			Event:  "usage_unmapped",
-			Reason: fmt.Sprintf("usage 无法定位账号 auth=%s idx=%s", obs.AuthID, obs.AuthIndex),
+			Source: sourcePassive,
+			Reason: fmt.Sprintf("usage 无法定位账号 auth=%s idx=%s", usage.AuthID, usage.AuthIndex),
 		})
 		return
 	}
 
-	class, tps := classifyObservation(pol, obs)
+	class, tps := classifyObservation(pol, usage)
+	applyObservation(store, auth, observation{
+		Classification: class,
+		TPS:            tps,
+		OutputTokens:   usage.OutputTokens,
+		DurationMs:     usage.DurationMs,
+		FirstTokenMs:   usage.FirstTokenMs,
+		Failed:         usage.Failed,
+		Source:         sourcePassive,
+	})
+}
+
+// applyObservation records one sample against an account, updates its strike
+// counters, and runs the configured action when a tier trips.
+func applyObservation(store *stateStore, auth authFile, obs observation) {
+	pol := store.policy()
 	now := float64(time.Now().Unix())
 	var (
 		tier    string
@@ -206,18 +236,19 @@ func handleAccountUsage(store *stateStore, record map[string]any) {
 			r.Reason = ""
 			cleared = true
 		}
-		r.LastClassification = class
-		r.LastOutputTPS = tps
+		r.LastClassification = obs.Classification
+		r.LastOutputTPS = obs.TPS
 		r.LastOutputTokens = obs.OutputTokens
 		r.LastDurationMs = obs.DurationMs
 		r.LastFirstTokenMs = obs.FirstTokenMs
 		r.LastObservedAt = now
+		r.LastSource = obs.Source
 		r.ObservedCount++
 		// 任意一次非失败观测清零失败计数。
 		if !obs.Failed {
 			r.FailStrikes = 0
 		}
-		switch class {
+		switch obs.Classification {
 		case "healthy":
 			r.SoftStrikes = 0
 		case tierSoft:
@@ -234,16 +265,29 @@ func handleAccountUsage(store *stateStore, record map[string]any) {
 			}
 		}
 	})
-	store.bumpStat(class, obs.OutputTokens)
+	store.bumpStat(obs.Classification, obs.OutputTokens)
 	if err != nil || rec == nil {
 		return
 	}
+
+	store.appendEvent(guardEvent{
+		Event:          "account_observed",
+		AccountKey:     rec.Key,
+		AccountName:    rec.Name,
+		Email:          rec.Email,
+		Classification: obs.Classification,
+		OutputTPS:      obs.TPS,
+		Source:         obs.Source,
+		Reason:         observationDetail(pol, rec, obs),
+	})
+
 	if cleared {
 		store.appendEvent(guardEvent{
 			Event:       "account_action_cleared",
 			AccountKey:  rec.Key,
 			AccountName: rec.Name,
 			Email:       rec.Email,
+			Source:      obs.Source,
 			Reason:      "账号已恢复启用，清除历史动作标记",
 		})
 	}
@@ -254,18 +298,35 @@ func handleAccountUsage(store *stateStore, record map[string]any) {
 	var reason string
 	switch tier {
 	case tierSoft:
-		reason = fmt.Sprintf("连续 %d 次软阈值降智 Token/s=%.1f", rec.SoftStrikes, tps)
+		reason = fmt.Sprintf("连续 %d 次软阈值降智 Token/s=%.1f", rec.SoftStrikes, obs.TPS)
 	case tierHard:
-		reason = fmt.Sprintf("硬阈值降智 Token/s=%.1f", tps)
+		reason = fmt.Sprintf("硬阈值降智 Token/s=%.1f", obs.TPS)
 	case tierFail:
 		reason = fmt.Sprintf("连续 %d 次调用失败", rec.FailStrikes)
 	}
-	applyAccountAction(store, tier, auth, rec, reason, class, tps)
+	applyAccountAction(store, tier, auth, rec, reason, obs)
+}
+
+// observationDetail summarises one sample for the event stream.
+func observationDetail(pol policyConfig, rec *accountRecord, obs observation) string {
+	if obs.Detail != "" {
+		return obs.Detail
+	}
+	switch obs.Classification {
+	case tierSoft:
+		return fmt.Sprintf("软阈值累计 %d/%d · %d token / %dms", rec.SoftStrikes, pol.ConsecutiveSoft, obs.OutputTokens, obs.DurationMs)
+	case tierHard:
+		return fmt.Sprintf("硬阈值立即触发 · %d token / %dms", obs.OutputTokens, obs.DurationMs)
+	case "failed":
+		return fmt.Sprintf("失败累计 %d/%d", rec.FailStrikes, pol.ConsecutiveFail)
+	default:
+		return fmt.Sprintf("%d token / %dms", obs.OutputTokens, obs.DurationMs)
+	}
 }
 
 // applyAccountAction runs the configured action for a tripped tier:
 // safety valve → dry run → idempotency → execute.
-func applyAccountAction(store *stateStore, tier string, auth authFile, rec *accountRecord, reason, class string, tps float64) {
+func applyAccountAction(store *stateStore, tier string, auth authFile, rec *accountRecord, reason string, obs observation) {
 	pol := store.policy()
 	action := actionForTier(pol, tier)
 	if action == "" {
@@ -277,8 +338,9 @@ func applyAccountAction(store *stateStore, tier string, auth authFile, rec *acco
 		Email:          rec.Email,
 		Tier:           tier,
 		Action:         action,
-		Classification: class,
-		OutputTPS:      tps,
+		Classification: obs.Classification,
+		OutputTPS:      obs.TPS,
+		Source:         obs.Source,
 	}
 	emit := func(name, why string, dryRun bool) {
 		ev := base

@@ -80,6 +80,9 @@ const (
 	managementUIHeader  = "X-Grok2API-Account-Guard-UI"
 	resourceContentType = "text/html; charset=utf-8"
 	defaultStateFile    = "/CLIProxyAPI/plugin-data/account-guard/state.json"
+	// maxProbeBatch caps one quality-test request; the UI chunks larger
+	// selections so no single management request runs long.
+	maxProbeBatch = 5
 )
 
 //go:embed page.html
@@ -352,11 +355,35 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			p.FailAction = stringPick(raw, p.FailAction, "fail_action", "failAction")
 			p.MinKeepAccounts = intPick(raw, p.MinKeepAccounts, "min_keep_accounts", "minKeepAccounts")
 			p.DryRun = boolPick(raw, p.DryRun, "dry_run", "dryRun")
+			p.ProbeModel = stringPick(raw, p.ProbeModel, "probe_model", "probeModel")
+			p.ProbeMaxTokens = intPick(raw, p.ProbeMaxTokens, "probe_max_tokens", "probeMaxTokens")
 			if err := store.updatePolicy(p); err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("invalidPolicy", err.Error()))
 			}
 			return managementJSON(http.StatusOK, map[string]any{"data": store.policy(), "ok": true})
 		}
+
+	case "/accounts/quality-test":
+		if method != http.MethodPost {
+			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+		}
+		var raw map[string]any
+		_ = json.Unmarshal(body, &raw)
+		keys := stringList(raw["keys"])
+		if s := stringPick(raw, "", "key"); s != "" {
+			keys = append(keys, s)
+		}
+		if len(keys) == 0 {
+			return managementJSON(http.StatusBadRequest, errMsg("invalidBody", "keys 必填"))
+		}
+		if len(keys) > maxProbeBatch {
+			return managementJSON(http.StatusBadRequest, errMsg("tooManyKeys", fmt.Sprintf("单次最多检测 %d 个账号", maxProbeBatch)))
+		}
+		results, err := runQualityProbes(store, keys)
+		if err != nil {
+			return managementJSON(http.StatusBadRequest, errMsg("probeFailed", err.Error()))
+		}
+		return managementJSON(http.StatusOK, map[string]any{"data": map[string]any{"results": results}, "results": results})
 	}
 
 	return managementJSON(http.StatusNotFound, errMsg("notFound", "not found"))
@@ -411,6 +438,7 @@ func accountView(key string, a authFile, rec *accountRecord, present bool) map[s
 	view["last_duration_ms"] = rec.LastDurationMs
 	view["last_first_token_ms"] = rec.LastFirstTokenMs
 	view["last_observed_at"] = rec.LastObservedAt
+	view["last_source"] = rec.LastSource
 	view["observed_count"] = rec.ObservedCount
 	view["action"] = rec.Action
 	view["acted_at"] = rec.ActedAt
@@ -518,6 +546,25 @@ func boolPick(raw map[string]any, def bool, keys ...string) bool {
 		}
 	}
 	return def
+}
+
+func stringList(v any) []string {
+	out := []string{}
+	switch t := v.(type) {
+	case []any:
+		for _, x := range t {
+			if s, ok := x.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+	case []string:
+		for _, s := range t {
+			if strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+	}
+	return out
 }
 
 func firstString(payload map[string]any, keys ...string) string {
