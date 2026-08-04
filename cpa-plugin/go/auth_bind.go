@@ -39,10 +39,15 @@ type authFile struct {
 // a 60s TTL still picks up external CPA auth changes.
 const authListCacheTTL = 60 * time.Second
 
+// authListEmptyGrace bounds how long a warm pool survives a host that reports
+// zero auth files, so a genuine "all accounts removed" still lands.
+const authListEmptyGrace = 2 * time.Minute
+
 var (
 	authListMu      sync.Mutex
 	authListCache   []authFile
 	authListAt      time.Time
+	authListGoodAt  time.Time
 	authListLoading bool
 	authListWait    = sync.NewCond(&authListMu)
 )
@@ -51,6 +56,7 @@ func invalidateAuthListCache() {
 	authListMu.Lock()
 	authListCache = nil
 	authListAt = time.Time{}
+	authListGoodAt = time.Time{}
 	authListMu.Unlock()
 }
 
@@ -91,7 +97,16 @@ func listAuthFilesCached(force bool) ([]authFile, error) {
 	authListMu.Lock()
 	authListLoading = false
 	if err == nil {
-		authListCache = loaded
+		// A CPA auth reload window can briefly report zero auth files. Adopting
+		// that snapshot made probes fail with "没有可用的 CPA xAI 账号" for a full
+		// TTL while accounts existed, so keep the warm pool until the host stays
+		// empty past the grace window.
+		if len(loaded) > 0 {
+			authListCache = loaded
+			authListGoodAt = time.Now()
+		} else if time.Since(authListGoodAt) > authListEmptyGrace {
+			authListCache = loaded
+		}
 		authListAt = time.Now()
 	}
 	out := cloneAuthFiles(authListCache)

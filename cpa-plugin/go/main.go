@@ -75,7 +75,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.0.7"
+	pluginVersion       = "1.0.8"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -400,9 +400,7 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			if v, ok := raw["model"].(string); ok && v != "" {
 				p.Model = v
 			}
-			if v, ok := raw["disable_auth_on_hard"].(bool); ok {
-				p.DisableAuthOnHard = v
-			}
+			p.DisableAuthOnHard = boolPick(raw, p.DisableAuthOnHard, "disable_auth_on_hard", "disableAuthOnHard")
 			if err := store.updatePolicy(p); err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("invalidPolicy", err.Error()))
 			}
@@ -759,6 +757,15 @@ func intPick(raw map[string]any, def int, keys ...string) int {
 	for _, k := range keys {
 		if v, ok := raw[k]; ok {
 			return int(anyInt(v))
+		}
+	}
+	return def
+}
+
+func boolPick(raw map[string]any, def bool, keys ...string) bool {
+	for _, k := range keys {
+		if v, ok := raw[k].(bool); ok {
+			return v
 		}
 	}
 	return def

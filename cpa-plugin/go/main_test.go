@@ -521,3 +521,96 @@ func TestDebouncedPersistCoalescesStats(t *testing.T) {
 		t.Fatalf("passive total=%d want 20", st.Stats.Passive.Total)
 	}
 }
+
+func TestAuthListCacheKeepsWarmPoolWhenHostReportsEmpty(t *testing.T) {
+	invalidateAuthListCache()
+	empty := false
+	auths := map[string]map[string]any{
+		"a.json": {"type": "xai", "email": "a@example.test", "access_token": "t", "proxy_url": "http://127.0.0.1:1", "disabled": false},
+		"b.json": {"type": "xai", "email": "b@example.test", "access_token": "t", "proxy_url": "http://127.0.0.1:2", "disabled": false},
+	}
+	original := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			if empty {
+				// CPA auth reload window: host briefly reports zero auth files.
+				return json.Marshal(hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{}})
+			}
+			entries := make([]pluginapi.HostAuthFileEntry, 0, len(auths))
+			for name := range auths {
+				entries = append(entries, pluginapi.HostAuthFileEntry{ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai"})
+			}
+			return json.Marshal(hostAuthListResponse{Files: entries})
+		case pluginabi.MethodHostAuthGet:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			raw, ok := auths[request["auth_index"]]
+			if !ok {
+				return nil, fmt.Errorf("missing %s", request["auth_index"])
+			}
+			body, _ := json.Marshal(raw)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: request["auth_index"], Name: request["auth_index"], Path: "/auths/" + request["auth_index"], JSON: body})
+		default:
+			return nil, fmt.Errorf("unexpected %s", method)
+		}
+	}
+	defer func() {
+		hostCall = original
+		invalidateAuthListCache()
+	}()
+
+	if warm, err := listAuthFiles(); err != nil || len(warm) != 2 {
+		t.Fatalf("warm list: n=%d err=%v", len(warm), err)
+	}
+
+	empty = true
+	got, err := listAuthFilesFresh()
+	if err != nil || len(got) != 2 {
+		t.Fatalf("transient empty host list dropped the warm pool: n=%d err=%v", len(got), err)
+	}
+	// A quality probe must still find candidates during that window.
+	node := &nodeRecord{ProxyURL: "http://127.0.0.1:1"}
+	candidates, err := listAuthsForNode(node, 8)
+	if err != nil || len(candidates) == 0 {
+		t.Fatalf("listAuthsForNode during reload window: n=%d err=%v", len(candidates), err)
+	}
+
+	// Once the host keeps reporting empty past the grace window, accept it.
+	authListMu.Lock()
+	authListGoodAt = time.Now().Add(-2 * authListEmptyGrace)
+	authListMu.Unlock()
+	if got, err := listAuthFilesFresh(); err != nil || len(got) != 0 {
+		t.Fatalf("persistent empty pool not adopted: n=%d err=%v", len(got), err)
+	}
+}
+
+func TestPolicyAcceptsCamelCaseDisableAuthOnHard(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
+	put := func(v bool) {
+		body, _ := json.Marshal(map[string]any{"disableAuthOnHard": v})
+		raw, err := dispatchAPI(http.MethodPut, "/policy", nil, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var env envelope
+		if err := json.Unmarshal(raw, &env); err != nil {
+			t.Fatal(err)
+		}
+		var resp managementResponse
+		if err := json.Unmarshal(env.Result, &resp); err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status=%d body=%s", resp.StatusCode, resp.Body)
+		}
+	}
+	put(false)
+	if store.policy().DisableAuthOnHard {
+		t.Fatal("camelCase disableAuthOnHard=false was ignored")
+	}
+	put(true)
+	if !store.policy().DisableAuthOnHard {
+		t.Fatal("camelCase disableAuthOnHard=true was ignored")
+	}
+}
