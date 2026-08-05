@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -521,6 +522,38 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 		return nil, fmt.Errorf("没有可用的 CPA xAI 账号")
 	}
 	return out, nil
+}
+
+// listAnyAuthsForIsolationRetest returns up to limit enabled xAI accounts that
+// still have an access_token, in random order. Isolation retests must respect
+// the account-level disabled flag even when the node itself is quarantined.
+func listAnyAuthsForIsolationRetest(limit int) ([]authFile, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	auths, err := listAuthFiles()
+	if err != nil {
+		return nil, err
+	}
+	pool := make([]authFile, 0, len(auths))
+	for _, a := range auths {
+		if a.Disabled {
+			continue
+		}
+		tok, _ := a.Raw["access_token"].(string)
+		if strings.TrimSpace(tok) == "" {
+			continue
+		}
+		pool = append(pool, a)
+	}
+	if len(pool) == 0 {
+		return nil, fmt.Errorf("没有可用的 CPA xAI 账号")
+	}
+	rand.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
+	if len(pool) > limit {
+		pool = pool[:limit]
+	}
+	return pool, nil
 }
 
 // listBoundAuthSummaries returns lightweight account info for a node (no secrets).

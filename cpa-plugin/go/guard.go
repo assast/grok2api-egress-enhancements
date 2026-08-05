@@ -511,6 +511,14 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 	}
 
 	candidates, err := listAuthsForNode(node, 8)
+	// Isolation retest: bound accounts were migrated/disabled off this node.
+	// When no enabled candidate remains, borrow any account token at random so
+	// the channel can still be model-probed through node.ProxyURL.
+	if (err != nil || len(candidates) == 0) && node.DisabledByGuard {
+		if any, anyErr := listAnyAuthsForIsolationRetest(8); anyErr == nil && len(any) > 0 {
+			candidates, err = any, nil
+		}
+	}
 	if err != nil || len(candidates) == 0 {
 		res.Classification = "error"
 		res.ErrorKind = "no_account"

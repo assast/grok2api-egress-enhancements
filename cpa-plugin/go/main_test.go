@@ -770,6 +770,94 @@ func TestAuthListCacheKeepsWarmPoolWhenHostReportsEmpty(t *testing.T) {
 	}
 }
 
+func TestIsolationRetestExcludesDisabledAccounts(t *testing.T) {
+	invalidateAuthListCache()
+	// After quarantine, all token-bearing credentials in this fixture are
+	// disabled. Neither normal selection nor isolation retest may bypass that
+	// account-level flag.
+	auths := map[string]map[string]any{
+		"disabled-a.json": {
+			"type": "xai", "email": "a@example.test", "access_token": "token-a",
+			"proxy_url": "http://127.0.0.1:9001", "disabled": true, "disabled_reason": "egress-guard 隔离中",
+		},
+		"disabled-b.json": {
+			"type": "xai", "email": "b@example.test", "access_token": "token-b",
+			"proxy_url": "http://127.0.0.1:9002", "disabled": true, "disabled_reason": "egress-guard 降智隔离",
+		},
+		"no-token.json": {
+			"type": "xai", "email": "empty@example.test", "access_token": "",
+			"proxy_url": "http://127.0.0.1:9003", "disabled": false,
+		},
+	}
+	original := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			entries := make([]pluginapi.HostAuthFileEntry, 0, len(auths))
+			for name, raw := range auths {
+				disabled, _ := raw["disabled"].(bool)
+				entries = append(entries, pluginapi.HostAuthFileEntry{
+					ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai", Disabled: disabled,
+				})
+			}
+			return json.Marshal(hostAuthListResponse{Files: entries})
+		case pluginabi.MethodHostAuthGet:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			name := request["auth_index"]
+			if name == "" {
+				name = request["name"]
+			}
+			raw, ok := auths[name]
+			if !ok {
+				return nil, fmt.Errorf("missing %s", name)
+			}
+			body, _ := json.Marshal(raw)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: name, Name: name, Path: "/auths/" + name, JSON: body})
+		default:
+			return nil, fmt.Errorf("unexpected %s", method)
+		}
+	}
+	defer func() {
+		hostCall = original
+		invalidateAuthListCache()
+	}()
+
+	quarantined := &nodeRecord{ProxyURL: "http://127.0.0.1:9001", DisabledByGuard: true}
+	if got, err := listAuthsForNode(quarantined, 8); err == nil || len(got) != 0 {
+		t.Fatalf("enabled-only selection should be empty after isolation: n=%d err=%v", len(got), err)
+	}
+
+	pool, err := listAnyAuthsForIsolationRetest(8)
+	if err == nil || len(pool) != 0 {
+		t.Fatalf("isolation retest must reject disabled accounts: n=%d err=%v", len(pool), err)
+	}
+
+	// probeQuality candidate path: DisabledByGuard must not turn disabled
+	// credentials into a recovery candidate.
+	candidates, err := listAuthsForNode(quarantined, 8)
+	if err == nil || len(candidates) > 0 {
+		t.Fatal("precondition failed: expected no enabled candidates")
+	}
+	if quarantined.DisabledByGuard {
+		if pool, poolErr := listAnyAuthsForIsolationRetest(8); poolErr == nil || len(pool) > 0 {
+			t.Fatalf("isolation retest must not bypass disabled accounts: n=%d err=%v", len(pool), poolErr)
+		}
+	}
+
+	// Enabled accounts remain eligible even when they are not bound to the
+	// quarantined node.
+	auths["enabled-c.json"] = map[string]any{
+		"type": "xai", "email": "c@example.test", "access_token": "token-c",
+		"proxy_url": "http://127.0.0.1:9003", "disabled": false,
+	}
+	invalidateAuthListCache()
+	pool, err = listAnyAuthsForIsolationRetest(8)
+	if err != nil || len(pool) != 1 || pool[0].Name != "enabled-c.json" || pool[0].Disabled {
+		t.Fatalf("enabled isolation retest pool: n=%d err=%v, want enabled-c.json only", len(pool), err)
+	}
+}
+
 func TestPolicyAcceptsCamelCaseDisableAuthOnHard(t *testing.T) {
 	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
 	put := func(v bool) {
