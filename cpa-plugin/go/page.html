@@ -53,6 +53,7 @@
     .section-head p { margin: var(--space-3xs) 0 0; color: var(--muted-foreground); font-size: var(--text-xs); }
     .toolbar { flex-wrap: wrap; justify-content: flex-end; }
     .search { width: min(16rem, 100%); }
+    .status-filter { width: min(10rem, 100%); }
     input, select, textarea { min-height: 2.25rem; width: 100%; border: var(--rule-hairline) solid var(--input); border-radius: var(--radius-sm); padding: 0 var(--space-xs); background: var(--background); color: var(--foreground); }
     textarea { min-height: 14rem; resize: vertical; padding: var(--space-xs); font-family: var(--font-mono); font-size: var(--text-xs); line-height: 1.6; }
     input:hover, select:hover, textarea:hover { border-color: var(--ring); }
@@ -201,6 +202,15 @@
         <div><h2 id="nodes-title">出口节点</h2><p id="nodes-freshness">页面每 15 秒刷新；节点健康状态随请求审计或主动检测更新，代理凭据不会回显</p></div>
         <div class="toolbar">
           <input id="node-search" class="search" type="search" placeholder="搜索节点、IP 或 ID" aria-label="搜索节点">
+          <select id="node-status-filter" class="status-filter" aria-label="按状态筛选节点">
+            <option value="">全部状态</option>
+            <option value="healthy">健康</option>
+            <option value="suspicious">可疑</option>
+            <option value="error">检测失败</option>
+            <option value="quarantined">已隔离</option>
+            <option value="disabled">已停用</option>
+            <option value="pending">待检测</option>
+          </select>
           <button id="rebalance-nodes" class="button" type="button" title="按启用节点把 CPA 账号 proxy_url 重新均分">重平衡账号</button>
           <button id="bulk-add-node" class="button" type="button">批量添加</button>
           <button id="add-node" class="button primary" type="button">添加节点</button>
@@ -318,7 +328,7 @@
     'use strict';
     const PLUGIN_BASE = '/v0/resource/plugins/grok2api-egress';
     const MANAGEMENT_API = '/v0/management/grok2api-egress/api';
-    const state = { status: null, nodes: [], selected: new Set(), search: '', editing: null, confirm: null, loading: false, autoTimer: 0 };
+    const state = { status: null, nodes: [], selected: new Set(), search: '', statusFilter: '', editing: null, confirm: null, loading: false, autoTimer: 0 };
     const $ = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
     const number = (value) => new Intl.NumberFormat('zh-CN').format(Number(value || 0));
@@ -437,17 +447,31 @@
     }
     function filteredNodes() {
       const query = state.search.trim().toLowerCase();
-      if (!query) return state.nodes;
-      return state.nodes.filter((node) => [node.id,node.name,node.exitIp].some((value) => String(value || '').toLowerCase().includes(query)));
+      return state.nodes.filter((node) => {
+        const matchesQuery = !query || [node.id,node.name,node.exitIp].some((value) => String(value || '').toLowerCase().includes(query));
+        const matchesStatus = !state.statusFilter || nodeStatusKey(node, nodeGuard(node)) === state.statusFilter;
+        return matchesQuery && matchesStatus;
+      });
     }
     function nodeGuard(node) { return state.status?.nodes?.[node.id] || {}; }
+    function nodeStatusKey(node, guard) {
+      if (guard.disabled_by_guard) return 'quarantined';
+      if (!node.enabled) return 'disabled';
+      if (guard.error_strikes) return 'error';
+      if (guard.last_classification === 'hard' || guard.last_classification === 'soft') return 'suspicious';
+      if (guard.last_classification === 'healthy') return 'healthy';
+      return 'pending';
+    }
     function nodeBadge(node, guard) {
-      if (guard.disabled_by_guard) return '<span class="badge bad">已隔离</span>';
-      if (!node.enabled) return '<span class="badge muted">已停用</span>';
-      if (guard.error_strikes) return '<span class="badge warn">检测失败</span>';
-      if (guard.last_classification === 'hard' || guard.last_classification === 'soft') return '<span class="badge warn">可疑</span>';
-      if (guard.last_classification === 'healthy') return '<span class="badge good">健康</span>';
-      return '<span class="badge muted">待检测</span>';
+      const badges = {
+        quarantined: '<span class="badge bad">已隔离</span>',
+        disabled: '<span class="badge muted">已停用</span>',
+        error: '<span class="badge warn">检测失败</span>',
+        suspicious: '<span class="badge warn">可疑</span>',
+        healthy: '<span class="badge good">健康</span>',
+        pending: '<span class="badge muted">待检测</span>'
+      };
+      return badges[nodeStatusKey(node, guard)];
     }
     function quarantineCountdown(guard) {
       const until = Number(guard.quarantined_until || 0);
@@ -486,8 +510,10 @@
       $('select-all').checked = nodes.length > 0 && nodes.every((node) => state.selected.has(node.id));
       $('select-all').indeterminate = !($('select-all').checked) && nodes.some((node) => state.selected.has(node.id));
       if (!nodes.length) {
-        $('nodes-body').innerHTML = '<tr><td colspan="9" class="empty">' + (state.search ? '没有匹配的节点' : '暂无出口节点') + '</td></tr>';
-        $('node-cards').innerHTML = '<div class="empty">' + (state.search ? '没有匹配的节点' : '暂无出口节点') + '</div>';
+        const hasFilter = state.search || state.statusFilter;
+        const emptyText = hasFilter ? '没有匹配的节点' : '暂无出口节点';
+        $('nodes-body').innerHTML = '<tr><td colspan="9" class="empty">' + emptyText + '</td></tr>';
+        $('node-cards').innerHTML = '<div class="empty">' + emptyText + '</div>';
         return;
       }
       $('nodes-body').innerHTML = nodes.map((node) => {
@@ -677,6 +703,7 @@
       localStorage.setItem('grok2api-egress-theme', dark ? 'light' : 'dark');
     });
     $('node-search').addEventListener('input', (event) => { state.search = event.target.value; renderNodes(); });
+    $('node-status-filter').addEventListener('change', (event) => { state.statusFilter = event.target.value; renderNodes(); });
     $('add-node').addEventListener('click', () => openNode());
     $('bulk-add-node').addEventListener('click', () => openModal('bulk-node-modal'));
     $('bulk-node-input').addEventListener('input', (event) => {
