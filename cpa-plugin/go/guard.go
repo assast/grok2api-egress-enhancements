@@ -495,6 +495,17 @@ func isAuthErrorRetryable(status int, body string) bool {
 		strings.Contains(lower, "x_xai_token_auth=none")
 }
 
+func containsProbeRetryKeyword(message string, keywords []string) bool {
+	lowerMessage := strings.ToLower(message)
+	for _, keyword := range keywords {
+		keyword = strings.TrimSpace(keyword)
+		if keyword != "" && strings.Contains(lowerMessage, strings.ToLower(keyword)) {
+			return true
+		}
+	}
+	return false
+}
+
 func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 	pol := store.policy()
 	res := qualityResult{Model: pol.Model}
@@ -542,10 +553,11 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 	if maxTok <= 0 {
 		maxTok = 256
 	}
+	prompt := normalizeProbePrompt(pol.ProbePrompt)
 	payload := map[string]any{
 		"model": pol.Model,
 		"messages": []map[string]string{
-			{"role": "user", "content": "我要去洗车，但洗车店离我家只有5m,我应该走路去还是开车去？请思考后直接给出答案"},
+			{"role": "user", "content": prompt},
 		},
 		"stream":      true,
 		"max_tokens":  maxTok,
@@ -574,7 +586,11 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		if errReq != nil {
 			res.Classification = "error"
 			res.ErrorKind = "request_error"
-			res.Error = "无法创建探测请求"
+			res.Error = "无法创建探测请求: " + errReq.Error()
+			if i+1 < len(candidates) && containsProbeRetryKeyword(res.Error, pol.ProbeRetryKeywords) {
+				lastErr = res.Error
+				continue
+			}
 			return res
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -592,15 +608,16 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		}
 
 		if resp.StatusCode >= 400 {
-			b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 			_ = resp.Body.Close()
-			msg := fmt.Sprintf("上游 HTTP %d: %s", resp.StatusCode, truncate(string(b), 160))
+			errorBody := string(b)
+			msg := fmt.Sprintf("上游 HTTP %d: %s", resp.StatusCode, truncate(errorBody, 160))
 			lastErr = msg
-			res.ErrorKind = classifyFailureKind(resp.StatusCode, string(b))
+			res.ErrorKind = classifyFailureKind(resp.StatusCode, errorBody)
 			res.DurationMs = time.Since(start).Milliseconds()
-			if (res.ErrorKind == "account_error" || isAuthErrorRetryable(resp.StatusCode, string(b))) && i+1 < len(candidates) {
-				// Account/quota errors belong to the credential, not the egress.
-				// Try another account on the same channel before classifying it.
+			if i+1 < len(candidates) && (res.ErrorKind == "account_error" || isAuthErrorRetryable(resp.StatusCode, errorBody) || containsProbeRetryKeyword(errorBody, pol.ProbeRetryKeywords)) {
+				// Account/quota errors and configured provider messages belong to the
+				// credential, not the egress. Try another account on this channel.
 				continue
 			}
 			res.Classification = "error"
@@ -835,6 +852,21 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 			n.LastReason = res.Error
 		} else if res.Classification == "healthy" {
 			n.LastReason = ""
+		}
+		if res.ErrorKind == "no_account" && source == "active" && n.DisabledByGuard {
+			retrySeconds := pol.QuarantineSec
+			if retrySeconds <= 0 {
+				retrySeconds = 120
+			}
+			nextRetry := now + float64(retrySeconds)
+			if n.QuarantinedUntil < nextRetry {
+				n.QuarantinedUntil = nextRetry
+			}
+			reason := res.Error
+			if strings.TrimSpace(reason) == "" {
+				reason = "没有可用的 CPA xAI 账号"
+			}
+			n.LastReason = reason + " · 账号池恢复后重试"
 		}
 		switch res.Classification {
 		case "healthy":

@@ -12,21 +12,25 @@ import (
 	"time"
 )
 
+const defaultProbePrompt = "我要去洗车，但洗车店离我家只有5m,我应该走路去还是开车去？请思考后直接给出答案"
+
 type policyConfig struct {
-	Mode                 string  `json:"mode"`
-	ActiveIntervalSec    int     `json:"active_interval_seconds"`
-	PassivePollSec       int     `json:"passive_poll_seconds"`
-	QuarantineSec        int     `json:"quarantine_seconds"`
-	SoftTPS              float64 `json:"soft_tps"`
-	HardTPS              float64 `json:"hard_tps"`
-	ConsecutiveSoft      int     `json:"consecutive_soft"`
-	ConsecutiveErrors    int     `json:"consecutive_errors"`
-	MinHealthyNodes      int     `json:"min_healthy_nodes"`
-	MinGenerationMs      int64   `json:"min_generation_ms"`
-	MinOutputTokens      int64   `json:"min_output_tokens"`
-	Model                string  `json:"model"`
-	DisableAuthOnHard    bool    `json:"disable_auth_on_hard"`
-	MaxOutputTokensProbe int     `json:"max_output_tokens"`
+	Mode                 string   `json:"mode"`
+	ActiveIntervalSec    int      `json:"active_interval_seconds"`
+	PassivePollSec       int      `json:"passive_poll_seconds"`
+	QuarantineSec        int      `json:"quarantine_seconds"`
+	SoftTPS              float64  `json:"soft_tps"`
+	HardTPS              float64  `json:"hard_tps"`
+	ConsecutiveSoft      int      `json:"consecutive_soft"`
+	ConsecutiveErrors    int      `json:"consecutive_errors"`
+	MinHealthyNodes      int      `json:"min_healthy_nodes"`
+	MinGenerationMs      int64    `json:"min_generation_ms"`
+	MinOutputTokens      int64    `json:"min_output_tokens"`
+	Model                string   `json:"model"`
+	ProbePrompt          string   `json:"probe_prompt"`
+	ProbeRetryKeywords   []string `json:"probe_retry_keywords,omitempty"`
+	DisableAuthOnHard    bool     `json:"disable_auth_on_hard"`
+	MaxOutputTokensProbe int      `json:"max_output_tokens"`
 }
 
 type nodeRecord struct {
@@ -140,9 +144,36 @@ func defaultPolicy() policyConfig {
 		MinGenerationMs:      1000,
 		MinOutputTokens:      32,
 		Model:                "grok-4.5",
+		ProbePrompt:          defaultProbePrompt,
 		DisableAuthOnHard:    true,
 		MaxOutputTokensProbe: 384,
 	}
+}
+
+func normalizeProbePrompt(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return defaultProbePrompt
+	}
+	return value
+}
+
+func normalizeProbeRetryKeywords(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func newStateStore(path string) *stateStore {
@@ -194,6 +225,8 @@ func (s *stateStore) load() error {
 	if data.Policy.MaxOutputTokensProbe <= 0 {
 		data.Policy.MaxOutputTokensProbe = 384
 	}
+	data.Policy.ProbePrompt = normalizeProbePrompt(data.Policy.ProbePrompt)
+	data.Policy.ProbeRetryKeywords = normalizeProbeRetryKeywords(data.Policy.ProbeRetryKeywords)
 	if data.Policy.Mode == "" {
 		data.Policy.Mode = "hybrid"
 	}
@@ -319,6 +352,8 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 	if p.Model == "" {
 		p.Model = "grok-4.5"
 	}
+	p.ProbePrompt = normalizeProbePrompt(p.ProbePrompt)
+	p.ProbeRetryKeywords = normalizeProbeRetryKeywords(p.ProbeRetryKeywords)
 	if p.ConsecutiveSoft <= 0 {
 		p.ConsecutiveSoft = 2
 	}

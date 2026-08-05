@@ -400,6 +400,8 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			if v, ok := raw["model"].(string); ok && v != "" {
 				p.Model = v
 			}
+			p.ProbePrompt = stringPick(raw, p.ProbePrompt, "probe_prompt", "probePrompt")
+			p.ProbeRetryKeywords = stringListPick(raw, p.ProbeRetryKeywords, "probe_retry_keywords", "probeRetryKeywords")
 			p.DisableAuthOnHard = boolPick(raw, p.DisableAuthOnHard, "disable_auth_on_hard", "disableAuthOnHard")
 			if err := store.updatePolicy(p); err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("invalidPolicy", err.Error()))
@@ -766,6 +768,43 @@ func boolPick(raw map[string]any, def bool, keys ...string) bool {
 	for _, k := range keys {
 		if v, ok := raw[k].(bool); ok {
 			return v
+		}
+	}
+	return def
+}
+
+func stringPick(raw map[string]any, def string, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := raw[k].(string); ok {
+			return v
+		}
+	}
+	return def
+}
+
+func stringListPick(raw map[string]any, def []string, keys ...string) []string {
+	for _, k := range keys {
+		value, ok := raw[k]
+		if !ok {
+			continue
+		}
+		switch typed := value.(type) {
+		case string:
+			return strings.Split(strings.ReplaceAll(typed, "\r\n", "\n"), "\n")
+		case []string:
+			return typed
+		case []any:
+			out := make([]string, 0, len(typed))
+			for _, item := range typed {
+				if s, ok := item.(string); ok {
+					out = append(out, s)
+				}
+			}
+			return out
+		case nil:
+			return []string{}
+		default:
+			return def
 		}
 	}
 	return def

@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,6 +74,101 @@ func TestSmallOutputIsIgnoredBeforeTPSThreshold(t *testing.T) {
 func TestDefaultPolicyUsesLowSoftThreshold(t *testing.T) {
 	if got := defaultPolicy().SoftTPS; got != 75 {
 		t.Fatalf("default soft threshold=%v, want 75", got)
+	}
+}
+
+func TestDefaultPolicyUsesConfigurableProbePrompt(t *testing.T) {
+	pol := defaultPolicy()
+	if pol.ProbePrompt != "我要去洗车，但洗车店离我家只有5m,我应该走路去还是开车去？请思考后直接给出答案" {
+		t.Fatalf("default probe prompt=%q", pol.ProbePrompt)
+	}
+	if len(pol.ProbeRetryKeywords) != 0 {
+		t.Fatalf("default retry keywords=%v, want empty", pol.ProbeRetryKeywords)
+	}
+}
+
+func TestProbeRetryKeywordMatchesCaseInsensitive(t *testing.T) {
+	if !containsProbeRetryKeyword("upstream ROTATE-ME response", []string{"rotate-me"}) {
+		t.Fatal("keyword matching should be case-insensitive")
+	}
+	if containsProbeRetryKeyword("upstream response", []string{"rotate-me"}) {
+		t.Fatal("unmatched keyword must not trigger retry")
+	}
+}
+
+func TestProbeQualityUsesPromptAndKeywordRetry(t *testing.T) {
+	invalidateAuthListCache()
+	var requests []map[string]any
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var payload map[string]any
+		_ = json.Unmarshal(body, &payload)
+		requests = append(requests, payload)
+		if token := r.Header.Get("Authorization"); token == "Bearer first-token" {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(strings.Repeat("x", 220) + " ROTATE-ME"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"thinking\":\"reasoning\",\"content\":\"answer\"}}],\"usage\":{\"completion_tokens\":40}}\n\ndata: [DONE]\n")
+	}))
+	defer proxy.Close()
+
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	pol := s.policy()
+	pol.ProbePrompt = "请用一句话回答这个自定义问题"
+	pol.ProbeRetryKeywords = []string{"rotate-me"}
+	if err := s.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"first.json":  {"type": "xai", "email": "first@example.test", "access_token": "first-token", "base_url": proxy.URL, "proxy_url": proxy.URL, "disabled": false},
+		"second.json": {"type": "xai", "email": "second@example.test", "access_token": "second-token", "base_url": proxy.URL, "proxy_url": proxy.URL, "disabled": false},
+	}
+	originalHostCall := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			return json.Marshal(hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{
+				{ID: "first.json", AuthIndex: "first.json", Name: "first.json", Provider: "xai", Type: "xai"},
+				{ID: "second.json", AuthIndex: "second.json", Name: "second.json", Provider: "xai", Type: "xai"},
+			}})
+		case pluginabi.MethodHostAuthGet:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			raw, ok := auths[request["auth_index"]]
+			if !ok {
+				return nil, fmt.Errorf("missing auth %s", request["auth_index"])
+			}
+			body, _ := json.Marshal(raw)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: request["auth_index"], Name: request["auth_index"], Path: "/auths/" + request["auth_index"], JSON: body})
+		default:
+			return nil, fmt.Errorf("unexpected host callback %s", method)
+		}
+	}
+	defer func() {
+		hostCall = originalHostCall
+		invalidateAuthListCache()
+	}()
+
+	result := probeQuality(s, &nodeRecord{ProxyURL: proxy.URL})
+	if result.Classification != "healthy" || result.AuthID != "second.json" {
+		t.Fatalf("probe result=%+v, want healthy result from second account", result)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("probe requests=%d, want first error plus one account retry", len(requests))
+	}
+	messages, ok := requests[0]["messages"].([]any)
+	if !ok || len(messages) != 1 {
+		t.Fatalf("probe messages=%v", requests[0]["messages"])
+	}
+	message, _ := messages[0].(map[string]any)
+	if message["content"] != pol.ProbePrompt {
+		t.Fatalf("probe prompt=%v, want %q", message["content"], pol.ProbePrompt)
 	}
 }
 
@@ -251,6 +348,48 @@ func TestWorkerPollIntervalUsesPassivePollSeconds(t *testing.T) {
 	}
 	if got := workerPollInterval(s); got != 7*time.Second {
 		t.Fatalf("workerPollInterval=%v, want 7s", got)
+	}
+}
+
+func TestQuarantinedNoAccountSchedulesNextRetest(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := s.createNode("Node 040", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.updateNode(node.ID, func(value *nodeRecord) error {
+		value.DisabledByGuard = true
+		value.QuarantinedUntil = float64(time.Now().Add(-time.Minute).Unix())
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.probeQualityFn = func(_ *stateStore, _ *nodeRecord) qualityResult {
+		return qualityResult{
+			Classification: "error",
+			ErrorKind:      "no_account",
+			Error:          "没有可用的 CPA xAI 账号",
+		}
+	}
+	if _, err := runNodeQuality(s, node.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	current, _ := s.getNode(node.ID)
+	if current.LastClassification != "ignored" {
+		t.Fatalf("no-account probe classification=%q, want ignored", current.LastClassification)
+	}
+	if current.LastReason != "没有可用的 CPA xAI 账号 · 账号池恢复后重试" {
+		t.Fatalf("no-account probe reason=%q", current.LastReason)
+	}
+	if !current.DisabledByGuard {
+		t.Fatal("no-account retest must keep the node quarantined")
+	}
+	if current.QuarantinedUntil <= float64(time.Now().Unix()) {
+		t.Fatalf("no-account retest did not schedule a future retry: until=%v", current.QuarantinedUntil)
+	}
+	if current.ErrorStrikes != 0 {
+		t.Fatalf("no-account retest must not spend transport error strikes: %d", current.ErrorStrikes)
 	}
 }
 
@@ -512,7 +651,7 @@ func TestStoreCreateNodesIsAllOrNothing(t *testing.T) {
 
 func TestRenderStatusPage(t *testing.T) {
 	page := strings.Replace(pageTemplate, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
-	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "批量添加", "/nodes/import", "页面每 15 秒刷新", "node-status-filter", "全部状态", "nodeStatusKey", "最短生成窗口", "X-Grok2API-Egress-UI"} {
+	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "批量添加", "/nodes/import", "页面每 15 秒刷新", "node-status-filter", "全部状态", "nodeStatusKey", "最短生成窗口", "policy-retry-keywords", "policy-prompt", "X-Grok2API-Egress-UI"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("missing %q", want)
 		}
@@ -885,5 +1024,35 @@ func TestPolicyAcceptsCamelCaseDisableAuthOnHard(t *testing.T) {
 	put(true)
 	if !store.policy().DisableAuthOnHard {
 		t.Fatal("camelCase disableAuthOnHard=true was ignored")
+	}
+}
+
+func TestPolicyAcceptsProbePromptAndRetryKeywords(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	body, _ := json.Marshal(map[string]any{
+		"probePrompt":        "  自定义探测问题  ",
+		"probeRetryKeywords": " rotate-me \n\n AUTH-FAIL \n rotate-me ",
+	})
+	raw, err := dispatchAPI(http.MethodPut, "/policy", nil, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	var resp managementResponse
+	if err := json.Unmarshal(env.Result, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, resp.Body)
+	}
+	pol := store.policy()
+	if pol.ProbePrompt != "自定义探测问题" {
+		t.Fatalf("probe prompt=%q", pol.ProbePrompt)
+	}
+	if got, want := strings.Join(pol.ProbeRetryKeywords, "|"), "rotate-me|AUTH-FAIL"; got != want {
+		t.Fatalf("probe retry keywords=%q, want %q", got, want)
 	}
 }

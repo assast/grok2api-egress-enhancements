@@ -299,6 +299,8 @@
           <div class="field"><label for="policy-min-output">最小判定 Token 数</label><input id="policy-min-output" type="number" min="1" max="10000"></div>
           <div class="field"><label for="policy-max-output">主动探测最大输出 Token</label><input id="policy-max-output" type="number" min="16" max="4096"></div>
           <div class="field"><label for="policy-model">主动探测模型</label><input id="policy-model" maxlength="120" autocomplete="off"></div>
+          <div class="field full"><label for="policy-retry-keywords">换号重试关键词</label><textarea id="policy-retry-keywords" rows="5" placeholder="一行一个关键词，例如：\nquota exceeded\naccount unavailable"></textarea><p class="help">上游错误包含任一关键词时，切换另一个 xAI 账号重试；空白行会忽略</p></div>
+          <div class="field full"><label for="policy-prompt">质量测试提示词</label><textarea id="policy-prompt" rows="4" maxlength="4000" placeholder="留空使用默认提示词"></textarea><p class="help">主动质量检测发送的用户提示词；留空会使用当前默认提示词</p></div>
           <div class="field"><label for="policy-min-healthy">最低健康节点数</label><input id="policy-min-healthy" type="number" min="1" max="1000"></div>
           <div class="field full check-row"><div><label for="policy-disable-auth">迁移失败时停用原节点账号</label><p class="help">启用可防止坏出口继续接收请求；手动停用账号不会被自动恢复</p></div><input id="policy-disable-auth" type="checkbox"></div>
         </div>
@@ -580,7 +582,7 @@
       const cfg = state.status?.config;
       $('edit-policy').disabled = !cfg;
       if (!cfg) { $('policy-view').innerHTML = '<div class="empty">策略状态不可用</div>'; return; }
-      const values = [['模式',modeName(cfg.mode)],['主动间隔',cfg.active_interval_seconds + ' 秒'],['审计轮询',cfg.passive_poll_seconds + ' 秒'],['软 / 硬阈值',cfg.soft_tps + ' / ' + cfg.hard_tps],['软计数 / 错误次数',cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],['最短生成窗口',(cfg.min_generation_ms || 1000) + ' ms'],['最小判定 Token',cfg.min_output_tokens || 32],['隔离复测',cfg.quarantine_seconds + ' 秒'],['最低健康节点',cfg.min_healthy_nodes],['探测输出',(cfg.max_output_tokens || 384) + ' Token'],['模型',cfg.model],['迁移失败停用',cfg.disable_auth_on_hard ? '是' : '否']];
+      const values = [['模式',modeName(cfg.mode)],['主动间隔',cfg.active_interval_seconds + ' 秒'],['审计轮询',cfg.passive_poll_seconds + ' 秒'],['软 / 硬阈值',cfg.soft_tps + ' / ' + cfg.hard_tps],['软计数 / 错误次数',cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],['最短生成窗口',(cfg.min_generation_ms || 1000) + ' ms'],['最小判定 Token',cfg.min_output_tokens || 32],['隔离复测',cfg.quarantine_seconds + ' 秒'],['最低健康节点',cfg.min_healthy_nodes],['探测输出',(cfg.max_output_tokens || 384) + ' Token'],['模型',cfg.model],['换号关键词',(cfg.probe_retry_keywords || []).length + ' 条'],['测试提示词',cfg.probe_prompt || '使用默认提示词'],['迁移失败停用',cfg.disable_auth_on_hard ? '是' : '否']];
       $('policy-view').innerHTML = values.map((value) => '<div><dt>' + value[0] + '</dt><dd>' + esc(value[1]) + '</dd></div>').join('');
     }
     function openModal(id) { $(id).hidden = false; document.body.style.overflow = 'hidden'; $(id).querySelector('input,select,textarea,button')?.focus(); }
@@ -608,7 +610,7 @@
       if (!cfg) return;
       $('policy-mode').value = cfg.mode; $('policy-active').value = cfg.active_interval_seconds; $('policy-passive').value = cfg.passive_poll_seconds;
       $('policy-quarantine').value = cfg.quarantine_seconds; $('policy-soft').value = cfg.soft_tps; $('policy-hard').value = cfg.hard_tps;
-      $('policy-soft-count').value = cfg.consecutive_soft; $('policy-error-count').value = cfg.consecutive_errors; $('policy-min-generation').value = cfg.min_generation_ms || 1000; $('policy-min-output').value = cfg.min_output_tokens || 32; $('policy-max-output').value = cfg.max_output_tokens || 384; $('policy-model').value = cfg.model || 'grok-4.5'; $('policy-disable-auth').checked = cfg.disable_auth_on_hard !== false; $('policy-min-healthy').value = cfg.min_healthy_nodes;
+      $('policy-soft-count').value = cfg.consecutive_soft; $('policy-error-count').value = cfg.consecutive_errors; $('policy-min-generation').value = cfg.min_generation_ms || 1000; $('policy-min-output').value = cfg.min_output_tokens || 32; $('policy-max-output').value = cfg.max_output_tokens || 384; $('policy-model').value = cfg.model || 'grok-4.5'; $('policy-retry-keywords').value = (cfg.probe_retry_keywords || []).join('\n'); $('policy-prompt').value = cfg.probe_prompt || ''; $('policy-disable-auth').checked = cfg.disable_auth_on_hard !== false; $('policy-min-healthy').value = cfg.min_healthy_nodes;
       openModal('policy-modal');
     }
     function parseBulkNodes(raw) {
@@ -785,7 +787,7 @@
     $('policy-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       const button = $('save-policy');
-      const body = {mode:$('policy-mode').value,activeIntervalSeconds:Number($('policy-active').value),passivePollSeconds:Number($('policy-passive').value),softTPS:Number($('policy-soft').value),hardTPS:Number($('policy-hard').value),consecutiveSoft:Number($('policy-soft-count').value),consecutiveErrors:Number($('policy-error-count').value),minGenerationMs:Number($('policy-min-generation').value),minOutputTokens:Number($('policy-min-output').value),maxOutputTokens:Number($('policy-max-output').value),model:$('policy-model').value.trim(),disableAuthOnHard:$('policy-disable-auth').checked,quarantineSeconds:Number($('policy-quarantine').value),minHealthyNodes:Number($('policy-min-healthy').value)};
+      const body = {mode:$('policy-mode').value,activeIntervalSeconds:Number($('policy-active').value),passivePollSeconds:Number($('policy-passive').value),softTPS:Number($('policy-soft').value),hardTPS:Number($('policy-hard').value),consecutiveSoft:Number($('policy-soft-count').value),consecutiveErrors:Number($('policy-error-count').value),minGenerationMs:Number($('policy-min-generation').value),minOutputTokens:Number($('policy-min-output').value),maxOutputTokens:Number($('policy-max-output').value),model:$('policy-model').value.trim(),probePrompt:$('policy-prompt').value,probeRetryKeywords:$('policy-retry-keywords').value,disableAuthOnHard:$('policy-disable-auth').checked,quarantineSeconds:Number($('policy-quarantine').value),minHealthyNodes:Number($('policy-min-healthy').value)};
       if (body.softTPS >= body.hardTPS) { toast('软阈值必须低于硬阈值', 'error'); return; }
       busy(button, true);
       try { await api('/quality-guard/config', {method:'PUT', body}); toast('守护策略已保存'); closeModal('policy-modal'); await load(true); }
