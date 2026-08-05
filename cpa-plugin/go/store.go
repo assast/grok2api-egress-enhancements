@@ -119,6 +119,10 @@ type stateStore struct {
 	// flushDelay batches high-frequency observation/event writes so every
 	// usage event does not MarshalIndent+fsync the full state file.
 	flushDelay time.Duration
+	// probeMu deduplicates background confirmations started by soft signals.
+	probeMu          sync.Mutex
+	softProbeRunning map[string]struct{}
+	probeQualityFn   func(*stateStore, *nodeRecord) qualityResult
 }
 
 func defaultPolicy() policyConfig {
@@ -127,7 +131,7 @@ func defaultPolicy() policyConfig {
 		ActiveIntervalSec:    1800,
 		PassivePollSec:       5,
 		QuarantineSec:        120,
-		SoftTPS:              500,
+		SoftTPS:              75,
 		HardTPS:              1000,
 		ConsecutiveSoft:      2,
 		ConsecutiveErrors:    2,
@@ -176,6 +180,9 @@ func (s *stateStore) load() error {
 	}
 	if data.Policy.HardTPS <= 0 {
 		data.Policy = defaultPolicy()
+	}
+	if data.Policy.SoftTPS <= 0 {
+		data.Policy.SoftTPS = 75
 	}
 	if data.Policy.MinGenerationMs <= 0 {
 		data.Policy.MinGenerationMs = 1000

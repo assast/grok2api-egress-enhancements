@@ -8,7 +8,7 @@
 | | |
 |---|---|
 | 插件名 | `grok2api-egress` |
-| 当前版本 | **1.0.8** |
+| 当前版本 | **1.0.9** |
 | 语言 | Go (`-buildmode=c-shared` → `.so`) |
 | CPA SDK | `CLIProxyAPI/v7` (`pluginabi` / `pluginapi`) |
 | 能力 | Management UI + Usage Plugin + Scheduler + Request Interceptor |
@@ -107,7 +107,7 @@
 | 等级 | 默认阈值 | 动作 |
 |---|---|---|
 | healthy | TPS &lt; soft | 保持 |
-| soft | ≥ `soft_tps`（500） | 连续 N 次 → 隔离 |
+| soft | ≥ `soft_tps`（75） | 只触发一次后台 thinking 复测；有 thinking 保持，无 thinking 才隔离 |
 | hard | ≥ `hard_tps`（1000）且满足最小 Token 证据 | 立即隔离 |
 | error | 探测失败 | 连续 N 次 → 隔离 |
 
@@ -122,7 +122,9 @@
 
 - `min_healthy_nodes`：低于阈值则 **suppressed**，避免全军覆没
 - `min_generation_ms = 1000`：极短生成窗口不虚高 TPS，降低 loadtest / 短回复误隔离
-- `min_output_tokens = 32`：证据不足的短输出标记为 ignored，不触发 soft/hard 隔离
+- `min_output_tokens = 32`：被动 TPS 证据不足的短输出标记为 ignored；主动探测仍以 thinking block 为最终依据
+
+主动质量探测使用“我要去洗车，但洗车店离我家只有5m,我应该走路去还是开车去？请思考后直接给出答案”作为思维题。探测会扫描 SSE 响应中的 `thinking`、兼容的 reasoning block 或 `reasoning_content`；成功响应包含 thinking 才算 healthy，否则标记为 hard。软阈值只负责在后台启动一次去重后的探测，不会因为 TPS 轻微异常直接禁用节点。
 
 ### 管理 UI
 
@@ -383,7 +385,7 @@ v1.0.7 起：
    以 `proxy_url` 字符串相等为键；Usage 事件里的 auth 标识会经 cache（index / id / name / email / path）反查。映射失败的异常只记录诊断事件，不猜测并隔离某个“最繁忙”节点，避免误杀。
 
 2. **Quality probe**
-   强制 Grok/xAI 客户端头；节点上多账号轮试，降低单账号 401 误判。
+   强制 Grok/xAI 客户端头；节点上多账号轮试，降低单账号 401 误判；思维题探测以响应是否包含 `thinking` block 作为最终质量信号。
 
 3. **隔离与恢复**
    quarantine 写状态 → 同步摘除账号 → 仅迁移到近期主动检测 healthy 且出口 IP 不同的节点 → 后台 worker 到期探测 → restore。迁移写入后会从 CPA Host API 再读一次，校验 `proxy_url` 与 disabled 状态。

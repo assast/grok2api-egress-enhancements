@@ -339,7 +339,7 @@ mode: hybrid
 active_interval_seconds: 1800
 passive_poll_seconds: 5
 quarantine_seconds: 120
-soft_tps: 500
+soft_tps: 75
 hard_tps: 1000
 consecutive_soft: 2
 consecutive_errors: 2
@@ -359,12 +359,12 @@ max_output_tokens: 384
 | `active_interval_seconds` | 健康节点主动质量探测间隔 | 默认 1800 秒，流量敏感可加长 |
 | `passive_poll_seconds` | 策略保留字段 | 当前 Usage 由 CPA 事件直接推送，不要把它理解成请求日志扫描间隔 |
 | `quarantine_seconds` | 隔离后等待自动复测的时间 | 已能强制换 IP 时 120 秒可作为起点 |
-| `soft_tps` | 可疑速度阈值 | 连续命中才隔离，先按实测分布调 |
+| `soft_tps` | 可疑速度阈值 | 默认 75；命中后后台用思维题探测 `thinking` block |
 | `hard_tps` | 硬阈值 | 命中立即隔离；误报代价高时适当上调 |
-| `consecutive_soft` | soft 连续次数 | 默认 2，降低误杀 |
+| `consecutive_soft` | soft 计数兼容字段 | 默认 2，仅用于诊断/兼容旧配置，不直接隔离 |
 | `consecutive_errors` | 探测错误连续次数 | 默认 2，避免瞬断直接隔离 |
 | `min_generation_ms` | 计算 TPS 所需的最短生成窗口 | 默认 1000 ms；过短时回退用全请求时长，避免首字接近结束时虚高 |
-| `min_output_tokens` | 进入 soft/hard 判定所需的最小输出 | 默认 32；不足时记为 ignored，不改变异常 strike |
+| `min_output_tokens` | 被动 TPS 进入 soft/hard 判定所需的最小输出 | 默认 32；不足时记为 ignored，主动探测仍以 thinking block 为准 |
 | `min_healthy_nodes` | 隔离后至少保留的健康节点数 | 3 节点通常设 1；需要双出口冗余可设 2 |
 | `model` | 主动探测模型 | 必须是 CPA/xAI auth 实际可用模型 |
 | `disable_auth_on_hard` | 迁移失败时是否禁用原节点账号 | 建议开启，防止坏出口继续承载请求 |

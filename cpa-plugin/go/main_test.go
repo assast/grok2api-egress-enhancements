@@ -69,6 +69,91 @@ func TestSmallOutputIsIgnoredBeforeTPSThreshold(t *testing.T) {
 	}
 }
 
+func TestDefaultPolicyUsesLowSoftThreshold(t *testing.T) {
+	if got := defaultPolicy().SoftTPS; got != 75 {
+		t.Fatalf("default soft threshold=%v, want 75", got)
+	}
+}
+
+func TestContainsThinkingBlock(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "thinking field", raw: `{"choices":[{"delta":{"thinking":"先判断洗车需要车辆到店"}}]}`, want: true},
+		{name: "reasoning content", raw: `{"choices":[{"delta":{"reasoning_content":"drive"}}]}`, want: true},
+		{name: "typed block", raw: `{"content":[{"type":"thinking","thinking":"drive"}]}`, want: true},
+		{name: "thinking markup", raw: `{"content":"<thinking>drive</thinking>"}`, want: true},
+		{name: "plain answer", raw: `{"choices":[{"delta":{"content":"开车去洗车。"}}]}`, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var value any
+			if err := json.Unmarshal([]byte(test.raw), &value); err != nil {
+				t.Fatal(err)
+			}
+			if got := containsThinkingBlock(value); got != test.want {
+				t.Fatalf("containsThinkingBlock()=%v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestQualityProbeUsesThinkingAsFinalSignal(t *testing.T) {
+	withoutThinking := normalizeQualityProbeResult(qualityResult{Classification: "healthy", TPS: 20})
+	if withoutThinking.Classification != "hard" || withoutThinking.ErrorKind != "missing_thinking" {
+		t.Fatalf("without thinking=%+v, want hard/missing_thinking", withoutThinking)
+	}
+	withThinking := normalizeQualityProbeResult(qualityResult{Classification: "soft", TPS: 200, Thinking: true})
+	if withThinking.Classification != "healthy" || withThinking.Error != "" {
+		t.Fatalf("with thinking=%+v, want healthy", withThinking)
+	}
+}
+
+func TestSoftObservationStartsOneBackgroundThinkingProbe(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := s.createNode("soft", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := make(chan struct{}, 2)
+	release := make(chan struct{})
+	s.probeQualityFn = func(_ *stateStore, _ *nodeRecord) qualityResult {
+		called <- struct{}{}
+		<-release
+		return qualityResult{Classification: "healthy", Thinking: true, OutputTokens: 80, TPS: 80}
+	}
+
+	soft := qualityResult{Classification: "soft", OutputTokens: 80, TPS: 80}
+	applyObservation(s, node.ID, "passive", soft)
+	applyObservation(s, node.ID, "passive", soft)
+	if current, _ := s.getNode(node.ID); current.DisabledByGuard {
+		t.Fatal("soft signal quarantined node before the background probe")
+	}
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("background thinking probe did not start")
+	}
+	select {
+	case extra := <-called:
+		_ = extra
+		t.Fatal("duplicate soft signal started a second probe")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		current, _ := s.getNode(node.ID)
+		if current.LastClassification == "healthy" && current.SoftStrikes == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	current, _ := s.getNode(node.ID)
+	t.Fatalf("background probe did not restore healthy state: %+v", current)
+}
+
 func TestManualDisabledAuthIsNotRestored(t *testing.T) {
 	if isGuardDisabledAuth(authFile{Disabled: true, Raw: map[string]any{"disabled_reason": "operator: maintenance"}}) {
 		t.Fatal("operator-disabled auth must not be treated as guard-managed")

@@ -252,10 +252,104 @@ type qualityResult struct {
 	OutputTokens   int64   `json:"output_tokens"`
 	DurationMs     int64   `json:"duration_ms"`
 	FirstTokenMs   int64   `json:"first_token_ms"`
+	Thinking       bool    `json:"thinking"`
 	ExitIP         string  `json:"exit_ip,omitempty"`
 	Error          string  `json:"error,omitempty"`
 	ErrorKind      string  `json:"error_kind,omitempty"`
 	Model          string  `json:"model,omitempty"`
+}
+
+func thinkingValuePresent(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(typed) != ""
+	case []any:
+		return len(typed) > 0
+	case map[string]any:
+		return len(typed) > 0
+	case bool:
+		return typed
+	case float64:
+		return typed > 0
+	case float32:
+		return typed > 0
+	case int:
+		return typed > 0
+	case int64:
+		return typed > 0
+	case json.Number:
+		return strings.TrimSpace(typed.String()) != "" && typed.String() != "0"
+	default:
+		return true
+	}
+}
+
+func containsThinkingMarkup(value string) bool {
+	lower := strings.ToLower(value)
+	for _, opening := range []string{"<thinking", "<think"} {
+		if start := strings.Index(lower, opening); start >= 0 && strings.Contains(lower[start:], ">") {
+			return true
+		}
+	}
+	return false
+}
+
+// containsThinkingBlock accepts the block-shaped responses used by different
+// OpenAI-compatible gateways, plus CPA/xAI's reasoning_content delta.
+func containsThinkingBlock(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			normalized := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(key), "-", "_"), " ", "_"))
+			if normalized == "type" {
+				if blockType, ok := child.(string); ok {
+					switch strings.ToLower(strings.TrimSpace(blockType)) {
+					case "thinking", "thinking_delta", "reasoning", "reasoning_content", "reasoning_delta":
+						return true
+					}
+				}
+			}
+			switch normalized {
+			case "thinking", "thinking_content", "reasoning", "reasoning_content", "reasoningcontent":
+				if thinkingValuePresent(child) {
+					return true
+				}
+			}
+			if containsThinkingBlock(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if containsThinkingBlock(child) {
+				return true
+			}
+		}
+	case string:
+		return containsThinkingMarkup(typed)
+	}
+	return false
+}
+
+// normalizeQualityProbeResult makes the model-quality signal authoritative for
+// active probes. TPS remains useful diagnostics, but a successful probe is
+// healthy only when its response contains a thinking block.
+func normalizeQualityProbeResult(res qualityResult) qualityResult {
+	if res.Classification == "error" {
+		return res
+	}
+	if res.Thinking {
+		res.Classification = "healthy"
+		res.Error = ""
+		res.ErrorKind = ""
+		return res
+	}
+	res.Classification = "hard"
+	res.ErrorKind = "missing_thinking"
+	res.Error = "质量探测响应未包含 thinking 块"
+	return res
 }
 
 func rotationAllowed(cfg pluginConfig, nodeID string) bool {
@@ -428,7 +522,7 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 	payload := map[string]any{
 		"model": pol.Model,
 		"messages": []map[string]string{
-			{"role": "user", "content": "Write a detailed technical explanation of how TCP slow start works, at least 12 sentences, plain text only."},
+			{"role": "user", "content": "我要去洗车，但洗车店离我家只有5m,我应该走路去还是开车去？请思考后直接给出答案"},
 		},
 		"stream":      true,
 		"max_tokens":  maxTok,
@@ -496,15 +590,23 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 			contentLen   int
 			usageOut     int64
 			usageReason  int64
+			hasThinking  bool
 		)
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
-			line := scanner.Text()
-			if !strings.HasPrefix(line, "data:") {
+			line := strings.TrimSpace(scanner.Text())
+			if containsThinkingMarkup(line) {
+				hasThinking = true
+			}
+			data := line
+			if strings.HasPrefix(data, "data:") {
+				data = strings.TrimSpace(strings.TrimPrefix(data, "data:"))
+			} else if !strings.HasPrefix(data, "{") {
+				// The normal response is SSE, but accepting a plain JSON
+				// body keeps the thinking check tied to the whole response.
 				continue
 			}
-			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 			if data == "" || data == "[DONE]" {
 				if data == "[DONE]" {
 					break
@@ -514,6 +616,9 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 			var chunk map[string]any
 			if json.Unmarshal([]byte(data), &chunk) != nil {
 				continue
+			}
+			if containsThinkingBlock(chunk) {
+				hasThinking = true
 			}
 			if u, ok := chunk["usage"].(map[string]any); ok {
 				usageOut = maxInt64(usageOut, outputTokensFromUsage(u))
@@ -567,6 +672,7 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		}
 		res.OutputTokens = outTokens
 		res.TPS = computeTPS(outTokens, res.DurationMs, res.FirstTokenMs, pol.MinGenerationMs)
+		res.Thinking = hasThinking
 		res.Classification = classifyQuality(res.TPS, outTokens, pol)
 		if res.Classification == "unknown" && outTokens == 0 {
 			lastErr = "探测无输出"
@@ -575,7 +681,7 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		}
 		res.Error = ""
 		res.ErrorKind = ""
-		return res
+		return normalizeQualityProbeResult(res)
 	}
 
 	res.Classification = "error"
@@ -605,6 +711,70 @@ func anyInt(v any) int64 {
 	}
 }
 
+func (s *stateStore) runQualityProbe(node *nodeRecord) qualityResult {
+	if s != nil && s.probeQualityFn != nil {
+		return s.probeQualityFn(s, node)
+	}
+	return probeQuality(s, node)
+}
+
+func (s *stateStore) beginSoftQualityProbe(nodeID string) bool {
+	if s == nil || strings.TrimSpace(nodeID) == "" {
+		return false
+	}
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	if s.softProbeRunning == nil {
+		s.softProbeRunning = make(map[string]struct{})
+	}
+	if _, ok := s.softProbeRunning[nodeID]; ok {
+		return false
+	}
+	s.softProbeRunning[nodeID] = struct{}{}
+	return true
+}
+
+func (s *stateStore) endSoftQualityProbe(nodeID string) {
+	if s == nil {
+		return
+	}
+	s.probeMu.Lock()
+	delete(s.softProbeRunning, nodeID)
+	s.probeMu.Unlock()
+}
+
+func scheduleSoftQualityProbe(store *stateStore, nodeID, nodeName string) {
+	if store == nil || !store.beginSoftQualityProbe(nodeID) {
+		return
+	}
+	store.appendEvent(guardEvent{
+		Event:    "soft_quality_probe_scheduled",
+		NodeID:   nodeID,
+		NodeName: nodeName,
+		Reason:   "软阈值触发后台 thinking 质量确认",
+	})
+	go func() {
+		defer store.endSoftQualityProbe(nodeID)
+		node, ok := store.getNode(nodeID)
+		if !ok || !node.Enabled || node.DisabledByGuard {
+			return
+		}
+		res := normalizeQualityProbeResult(store.runQualityProbe(node))
+		if res.Classification == "error" && res.ErrorKind != "transport_error" {
+			res.Classification = "ignored"
+		}
+		applyObservation(store, nodeID, "active", res)
+		store.appendEvent(guardEvent{
+			Event:          "soft_quality_probe_completed",
+			NodeID:         nodeID,
+			NodeName:       node.Name,
+			Classification: res.Classification,
+			OutputTPS:      res.TPS,
+			Reason:         res.Error,
+		})
+	}()
+}
+
 func applyObservation(store *stateStore, nodeID, source string, res qualityResult) {
 	pol := store.policy()
 	if res.Classification == "error" && res.ErrorKind != "transport_error" {
@@ -614,6 +784,7 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	var (
 		doRestore     bool
 		doQuarantine  bool
+		doSoftProbe   bool
 		quarantineWhy string
 		nodeCopy      nodeRecord
 	)
@@ -647,9 +818,13 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 			}
 		case "soft":
 			n.SoftStrikes++
-			if n.SoftStrikes >= pol.ConsecutiveSoft && !n.DisabledByGuard {
-				doQuarantine = true
-				quarantineWhy = fmt.Sprintf("连续软阈值 Token/s=%.1f", res.TPS)
+			n.LastReason = fmt.Sprintf("软阈值 Token/s=%.1f · 等待 thinking 复测", res.TPS)
+			if !n.DisabledByGuard {
+				// A soft signal is only a trigger. Let one deduplicated
+				// background model probe confirm thinking before isolating.
+				doSoftProbe = true
+			} else {
+				n.LastReason += " · 节点已隔离"
 			}
 		case "hard":
 			if !n.DisabledByGuard {
@@ -686,6 +861,9 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		quarantineNode(store, nodeCopy.ID, quarantineWhy, res.TPS, res.Classification)
 	}
 	store.bumpStat(source, res.Classification, res.OutputTokens)
+	if doSoftProbe {
+		scheduleSoftQualityProbe(store, nodeCopy.ID, nodeCopy.Name)
+	}
 }
 
 func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class string) {
@@ -780,7 +958,7 @@ func runNodeQuality(store *stateStore, id string) (map[string]any, error) {
 	if n.DisabledByGuard && n.QuarantinedUntil > float64(time.Now().Unix()) {
 		// still allow manual quality test for recovery
 	}
-	res := probeQuality(store, n)
+	res := normalizeQualityProbeResult(store.runQualityProbe(n))
 	if res.Classification == "error" && res.ErrorKind != "transport_error" {
 		res.Classification = "ignored"
 	}
@@ -800,6 +978,7 @@ func runNodeQuality(store *stateStore, id string) (map[string]any, error) {
 		"outputTokens":   res.OutputTokens,
 		"durationMs":     res.DurationMs,
 		"firstTokenMs":   res.FirstTokenMs,
+		"thinking":       res.Thinking,
 		"exitIp":         res.ExitIP,
 		"error":          res.Error,
 		"errorKind":      res.ErrorKind,
