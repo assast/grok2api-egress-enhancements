@@ -352,6 +352,19 @@ func normalizeQualityProbeResult(res qualityResult) qualityResult {
 	return res
 }
 
+func quarantineReason(res qualityResult) string {
+	if reason := strings.TrimSpace(res.Error); reason != "" {
+		return reason
+	}
+	switch res.ErrorKind {
+	case "missing_thinking":
+		return "质量探测响应未包含 thinking 块"
+	case "probe_unstable":
+		return "质量探测响应不稳定"
+	}
+	return fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
+}
+
 func rotationAllowed(cfg pluginConfig, nodeID string) bool {
 	if strings.TrimSpace(cfg.RotationURL) == "" || strings.TrimSpace(nodeID) == "" {
 		return false
@@ -829,7 +842,7 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		case "hard":
 			if !n.DisabledByGuard {
 				doQuarantine = true
-				quarantineWhy = fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
+				quarantineWhy = quarantineReason(res)
 			}
 		case "error":
 			n.ErrorStrikes++

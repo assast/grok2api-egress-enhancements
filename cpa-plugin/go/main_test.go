@@ -110,6 +110,33 @@ func TestQualityProbeUsesThinkingAsFinalSignal(t *testing.T) {
 	}
 }
 
+func TestQuarantineReasonPreservesQualityFailure(t *testing.T) {
+	withoutThinking := quarantineReason(qualityResult{
+		Classification: "hard",
+		TPS:            0.1,
+		ErrorKind:      "missing_thinking",
+		Error:          "质量探测响应未包含 thinking 块",
+	})
+	if withoutThinking != "质量探测响应未包含 thinking 块" {
+		t.Fatalf("missing-thinking reason=%q, want quality failure", withoutThinking)
+	}
+
+	transport := quarantineReason(qualityResult{
+		Classification: "hard",
+		TPS:            0.1,
+		ErrorKind:      "transport_error",
+		Error:          "模型探测请求失败: proxyconnect connection refused",
+	})
+	if transport != "模型探测请求失败: proxyconnect connection refused" {
+		t.Fatalf("transport reason=%q, want transport error", transport)
+	}
+
+	threshold := quarantineReason(qualityResult{Classification: "hard", TPS: 1000})
+	if threshold != "硬阈值 Token/s=1000.0" {
+		t.Fatalf("threshold reason=%q, want hard threshold", threshold)
+	}
+}
+
 func TestSoftObservationStartsOneBackgroundThinkingProbe(t *testing.T) {
 	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	node, err := s.createNode("soft", "http://127.0.0.1:7951", true, false, 0)
