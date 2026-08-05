@@ -281,8 +281,8 @@
           <div class="field"><label for="policy-active">主动检测间隔（秒）</label><input id="policy-active" type="number" min="60" max="86400"></div>
           <div class="field"><label for="policy-passive">审计轮询间隔（秒）</label><input id="policy-passive" type="number" min="1" max="3600"><p class="help">后台 worker 扫描/复测节奏</p></div>
           <div class="field"><label for="policy-quarantine">隔离复测间隔（秒）</label><input id="policy-quarantine" type="number" min="30" max="86400"></div>
-          <div class="field"><label for="policy-soft">软阈值 Token/s</label><input id="policy-soft" type="number" min="1" max="9999" step="1"></div>
-          <div class="field"><label for="policy-hard">硬阈值 Token/s</label><input id="policy-hard" type="number" min="2" max="10000" step="1"></div>
+          <div class="field"><label for="policy-soft">软阈值 Token/s（仅被动）</label><input id="policy-soft" type="number" min="1" max="9999" step="1"></div>
+          <div class="field"><label for="policy-hard">硬阈值 Token/s（仅被动·触发 thinking）</label><input id="policy-hard" type="number" min="2" max="10000" step="1"></div>
           <div class="field"><label for="policy-soft-count">连续软异常次数</label><input id="policy-soft-count" type="number" min="1" max="20"><p class="help">达到后触发 thinking 复测</p></div>
           <div class="field"><label for="policy-error-count">连续错误次数</label><input id="policy-error-count" type="number" min="1" max="20"></div>
           <div class="field"><label for="policy-min-generation">最短生成窗口（毫秒）</label><input id="policy-min-generation" type="number" min="200" max="10000"></div>

@@ -770,7 +770,7 @@ func scheduleSoftQualityProbe(store *stateStore, nodeID, nodeName string, trigge
 		NodeName:  nodeName,
 		AuthID:    trigger.AuthID,
 		AuthEmail: trigger.AuthEmail,
-		Reason:    "连续软阈值触发后台 thinking 质量确认",
+		Reason:    "被动阈值触发后台 thinking 质量确认",
 	})
 	go func() {
 		defer store.endSoftQualityProbe(nodeID)
@@ -838,6 +838,11 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 				doRestore = true
 			}
 		case "soft":
+			// SoftTPS only drives passive usage signals; active probes are
+			// decided solely by thinking presence via normalizeQualityProbeResult.
+			if source != "passive" {
+				break
+			}
 			n.SoftStrikes++
 			need := pol.ConsecutiveSoft
 			if need <= 0 {
@@ -853,7 +858,17 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 				n.LastReason += " · 节点已隔离"
 			}
 		case "hard":
-			if !n.DisabledByGuard {
+			if source == "passive" {
+				// Passive hard TPS only schedules a thinking re-probe; never
+				// quarantines on the usage signal alone.
+				if !n.DisabledByGuard {
+					doSoftProbe = true
+					n.LastReason = fmt.Sprintf("硬阈值 Token/s=%.1f · thinking 复测", res.TPS)
+				} else {
+					n.LastReason = fmt.Sprintf("硬阈值 Token/s=%.1f · 节点已隔离", res.TPS)
+				}
+			} else if !n.DisabledByGuard {
+				// Active hard comes from missing thinking / probe failure.
 				doQuarantine = true
 				quarantineWhy = quarantineReason(res)
 			}

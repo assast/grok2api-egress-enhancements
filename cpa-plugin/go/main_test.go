@@ -190,6 +190,58 @@ func TestSoftObservationStartsOneBackgroundThinkingProbe(t *testing.T) {
 	t.Fatalf("background probe did not restore healthy state: %+v", current)
 }
 
+func TestPassiveHardSchedulesThinkingProbeWithoutQuarantine(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := s.createNode("hard-passive", "http://127.0.0.1:7952", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// spare healthy node so quarantine would otherwise be allowed
+	if _, err := s.createNode("spare", "http://127.0.0.1:7953", true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	called := make(chan struct{}, 1)
+	s.probeQualityFn = func(_ *stateStore, _ *nodeRecord) qualityResult {
+		called <- struct{}{}
+		return qualityResult{Classification: "healthy", Thinking: true, OutputTokens: 80, TPS: 80}
+	}
+
+	hard := qualityResult{Classification: "hard", OutputTokens: 200, TPS: 2000, AuthEmail: "hard@x.ai"}
+	applyObservation(s, node.ID, "passive", hard)
+	current, _ := s.getNode(node.ID)
+	if current.DisabledByGuard {
+		t.Fatal("passive hard TPS must not quarantine before thinking probe")
+	}
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("passive hard did not schedule thinking probe")
+	}
+}
+
+func TestActiveHardStillQuarantines(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := s.createNode("hard-active", "http://127.0.0.1:7954", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.createNode("spare2", "http://127.0.0.1:7955", true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	hard := qualityResult{
+		Classification: "hard",
+		OutputTokens:   0,
+		TPS:            0.1,
+		ErrorKind:      "missing_thinking",
+		Error:          "质量探测响应未包含 thinking 块",
+	}
+	applyObservation(s, node.ID, "active", hard)
+	current, _ := s.getNode(node.ID)
+	if !current.DisabledByGuard {
+		t.Fatal("active hard (missing thinking) must quarantine")
+	}
+}
+
 func TestWorkerPollIntervalUsesPassivePollSeconds(t *testing.T) {
 	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	pol := s.policy()
