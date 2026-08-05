@@ -148,11 +148,20 @@ func TestSoftObservationStartsOneBackgroundThinkingProbe(t *testing.T) {
 	s.probeQualityFn = func(_ *stateStore, _ *nodeRecord) qualityResult {
 		called <- struct{}{}
 		<-release
-		return qualityResult{Classification: "healthy", Thinking: true, OutputTokens: 80, TPS: 80}
+		return qualityResult{Classification: "healthy", Thinking: true, OutputTokens: 80, TPS: 80, AuthEmail: "probe@x.ai"}
 	}
 
-	soft := qualityResult{Classification: "soft", OutputTokens: 80, TPS: 80}
+	soft := qualityResult{Classification: "soft", OutputTokens: 80, TPS: 80, AuthID: "auth-1", AuthEmail: "soft@x.ai"}
 	applyObservation(s, node.ID, "passive", soft)
+	if current, _ := s.getNode(node.ID); current.SoftStrikes != 1 {
+		t.Fatalf("first soft should only count, strikes=%d", current.SoftStrikes)
+	}
+	select {
+	case <-called:
+		t.Fatal("thinking probe started before consecutive_soft was reached")
+	case <-time.After(30 * time.Millisecond):
+	}
+
 	applyObservation(s, node.ID, "passive", soft)
 	if current, _ := s.getNode(node.ID); current.DisabledByGuard {
 		t.Fatal("soft signal quarantined node before the background probe")
@@ -179,6 +188,18 @@ func TestSoftObservationStartsOneBackgroundThinkingProbe(t *testing.T) {
 	}
 	current, _ := s.getNode(node.ID)
 	t.Fatalf("background probe did not restore healthy state: %+v", current)
+}
+
+func TestWorkerPollIntervalUsesPassivePollSeconds(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	pol := s.policy()
+	pol.PassivePollSec = 7
+	if err := s.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	if got := workerPollInterval(s); got != 7*time.Second {
+		t.Fatalf("workerPollInterval=%v, want 7s", got)
+	}
 }
 
 func TestManualDisabledAuthIsNotRestored(t *testing.T) {

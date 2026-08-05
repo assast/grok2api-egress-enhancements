@@ -72,6 +72,7 @@ type guardEvent struct {
 	NodeID         string  `json:"node_id,omitempty"`
 	NodeName       string  `json:"node_name,omitempty"`
 	AuthID         string  `json:"auth_id,omitempty"`
+	AuthEmail      string  `json:"auth_email,omitempty"`
 	Reason         string  `json:"reason,omitempty"`
 	Classification string  `json:"classification,omitempty"`
 	OutputTPS      float64 `json:"output_tps,omitempty"`

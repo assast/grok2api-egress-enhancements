@@ -357,11 +357,11 @@ max_output_tokens: 384
 |---|---|---|
 | `mode` | `passive`、`active`、`hybrid` | 生产推荐 `hybrid` |
 | `active_interval_seconds` | 健康节点主动质量探测间隔 | 默认 1800 秒，流量敏感可加长 |
-| `passive_poll_seconds` | 策略保留字段 | 当前 Usage 由 CPA 事件直接推送，不要把它理解成请求日志扫描间隔 |
+| `passive_poll_seconds` | 后台 worker 扫描/复测节奏 | 默认 5 秒；越小越快发现隔离到期与主动探测到期 |
 | `quarantine_seconds` | 隔离后等待自动复测的时间 | 已能强制换 IP 时 120 秒可作为起点 |
 | `soft_tps` | 可疑速度阈值 | 默认 75；命中后后台用思维题探测 `thinking` block |
 | `hard_tps` | 硬阈值 | 命中立即隔离；误报代价高时适当上调 |
-| `consecutive_soft` | soft 计数兼容字段 | 默认 2，仅用于诊断/兼容旧配置，不直接隔离 |
+| `consecutive_soft` | 连续 soft 次数后触发 thinking 复测 | 默认 2；未达阈值只累计 soft_strikes，不启动复测 |
 | `consecutive_errors` | 探测错误连续次数 | 默认 2，避免瞬断直接隔离 |
 | `min_generation_ms` | 计算 TPS 所需的最短生成窗口 | 默认 1000 ms；过短时回退用全请求时长，避免首字接近结束时虚高 |
 | `min_output_tokens` | 被动 TPS 进入 soft/hard 判定所需的最小输出 | 默认 32；不足时记为 ignored，主动探测仍以 thinking block 为准 |
@@ -376,7 +376,7 @@ max_output_tokens: 384
 - `active`：只跑定时检测，不处理被动 Usage；
 - `hybrid`：普通请求实时发现异常，30 分钟主动兜底，推荐使用。
 
-默认后台 worker 每 30 秒扫描一次，所以“隔离 120 秒”表示到期后的下一个扫描周期触发复测，不保证精确到秒。
+默认后台 worker 按 `passive_poll_seconds`（默认 5 秒）扫描一次，所以“隔离 120 秒”表示到期后的下一个扫描周期触发复测，不保证精确到秒。
 
 ## 7. 隔离、迁号和恢复状态机
 
@@ -402,7 +402,7 @@ quarantined
 
 - 输出少于 `min_output_tokens` 的极短回复记为 ignored，不触发 soft/hard 隔离，也不重置已有 strike；
 - 小于 `min_generation_ms` 的生成窗口不会用虚高 TPS 直接判 hard；
-- hard 达阈值会立即隔离，soft 和 error 需要连续命中；
+- hard 达阈值会立即隔离；soft 连续达到 `consecutive_soft` 后做 thinking 复测，error 连续达到 `consecutive_errors` 才隔离；
 - 如果隔离会让其他健康节点少于 `min_healthy_nodes`，动作会显示为 `suppressed`；
 - 质量检测可轮试同一通道的多个账号；401/403/429、额度、权限和上游 5xx 记为 ignored，不应代表出口坏；只有明确连接拒绝、reset、timeout、EOF、代理认证等传输错误才累计出口 error strike；
 - 恢复只代表节点重新可用，不会自动把已迁账号迁回。
@@ -595,7 +595,7 @@ curl --fail --silent --show-error \
 
 ### 隔离到期后仍未恢复
 
-自动复测最多还会受 30 秒 worker 扫描周期影响。若真实模型检测返回 soft、hard 或 error，节点会保持隔离。先处理代理或账号问题，不要直接改状态文件。
+自动复测最多还会受 `passive_poll_seconds` worker 扫描周期影响。若真实模型检测返回 soft、hard 或 error，节点会保持隔离。先处理代理或账号问题，不要直接改状态文件。
 
 ### 出现 `node_rotation_failed`
 

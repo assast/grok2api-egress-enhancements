@@ -257,6 +257,8 @@ type qualityResult struct {
 	Error          string  `json:"error,omitempty"`
 	ErrorKind      string  `json:"error_kind,omitempty"`
 	Model          string  `json:"model,omitempty"`
+	AuthID         string  `json:"auth_id,omitempty"`
+	AuthEmail      string  `json:"auth_email,omitempty"`
 }
 
 func thinkingValuePresent(value any) bool {
@@ -687,6 +689,8 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		res.TPS = computeTPS(outTokens, res.DurationMs, res.FirstTokenMs, pol.MinGenerationMs)
 		res.Thinking = hasThinking
 		res.Classification = classifyQuality(res.TPS, outTokens, pol)
+		res.AuthID = firstNonEmpty(auth.ID, auth.Index, auth.Name)
+		res.AuthEmail = auth.Email
 		if res.Classification == "unknown" && outTokens == 0 {
 			lastErr = "探测无输出"
 			res.ErrorKind = "no_output"
@@ -756,15 +760,17 @@ func (s *stateStore) endSoftQualityProbe(nodeID string) {
 	s.probeMu.Unlock()
 }
 
-func scheduleSoftQualityProbe(store *stateStore, nodeID, nodeName string) {
+func scheduleSoftQualityProbe(store *stateStore, nodeID, nodeName string, trigger qualityResult) {
 	if store == nil || !store.beginSoftQualityProbe(nodeID) {
 		return
 	}
 	store.appendEvent(guardEvent{
-		Event:    "soft_quality_probe_scheduled",
-		NodeID:   nodeID,
-		NodeName: nodeName,
-		Reason:   "软阈值触发后台 thinking 质量确认",
+		Event:     "soft_quality_probe_scheduled",
+		NodeID:    nodeID,
+		NodeName:  nodeName,
+		AuthID:    trigger.AuthID,
+		AuthEmail: trigger.AuthEmail,
+		Reason:    "连续软阈值触发后台 thinking 质量确认",
 	})
 	go func() {
 		defer store.endSoftQualityProbe(nodeID)
@@ -781,6 +787,8 @@ func scheduleSoftQualityProbe(store *stateStore, nodeID, nodeName string) {
 			Event:          "soft_quality_probe_completed",
 			NodeID:         nodeID,
 			NodeName:       node.Name,
+			AuthID:         res.AuthID,
+			AuthEmail:      res.AuthEmail,
 			Classification: res.Classification,
 			OutputTPS:      res.TPS,
 			Reason:         res.Error,
@@ -831,12 +839,17 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 			}
 		case "soft":
 			n.SoftStrikes++
-			n.LastReason = fmt.Sprintf("软阈值 Token/s=%.1f · 等待 thinking 复测", res.TPS)
-			if !n.DisabledByGuard {
-				// A soft signal is only a trigger. Let one deduplicated
-				// background model probe confirm thinking before isolating.
+			need := pol.ConsecutiveSoft
+			if need <= 0 {
+				need = 2
+			}
+			n.LastReason = fmt.Sprintf("软阈值 Token/s=%.1f · soft %d/%d", res.TPS, n.SoftStrikes, need)
+			if !n.DisabledByGuard && n.SoftStrikes >= need {
+				// Soft only arms after consecutive hits. One deduplicated
+				// background model probe then confirms thinking before isolating.
 				doSoftProbe = true
-			} else {
+				n.LastReason = fmt.Sprintf("软阈值 Token/s=%.1f · 连续 soft 触发 thinking 复测", res.TPS)
+			} else if n.DisabledByGuard {
 				n.LastReason += " · 节点已隔离"
 			}
 		case "hard":
@@ -867,19 +880,27 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	}
 	if doRestore {
 		store.bumpAction("restored")
-		store.appendEvent(guardEvent{Event: "node_restored", NodeID: nodeCopy.ID, NodeName: nodeCopy.Name, Classification: "healthy", OutputTPS: res.TPS})
+		store.appendEvent(guardEvent{
+			Event:          "node_restored",
+			NodeID:         nodeCopy.ID,
+			NodeName:       nodeCopy.Name,
+			AuthID:         res.AuthID,
+			AuthEmail:      res.AuthEmail,
+			Classification: "healthy",
+			OutputTPS:      res.TPS,
+		})
 		go func(nn nodeRecord) { _ = enableAuthsOnNode(&nn) }(nodeCopy)
 	}
 	if doQuarantine {
-		quarantineNode(store, nodeCopy.ID, quarantineWhy, res.TPS, res.Classification)
+		quarantineNode(store, nodeCopy.ID, quarantineWhy, res.TPS, res.Classification, res)
 	}
 	store.bumpStat(source, res.Classification, res.OutputTokens)
 	if doSoftProbe {
-		scheduleSoftQualityProbe(store, nodeCopy.ID, nodeCopy.Name)
+		scheduleSoftQualityProbe(store, nodeCopy.ID, nodeCopy.Name, res)
 	}
 }
 
-func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class string) {
+func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class string, res qualityResult) {
 	pol := store.policy()
 	enabledHealthy := 0
 	var target *nodeRecord
@@ -897,7 +918,15 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 	}
 	if enabledHealthy < pol.MinHealthyNodes {
 		store.bumpAction("suppressed")
-		store.appendEvent(guardEvent{Event: "quarantine_suppressed", NodeID: target.ID, NodeName: target.Name, Reason: "低于最低健康节点数", OutputTPS: tps})
+		store.appendEvent(guardEvent{
+			Event:     "quarantine_suppressed",
+			NodeID:    target.ID,
+			NodeName:  target.Name,
+			AuthID:    res.AuthID,
+			AuthEmail: res.AuthEmail,
+			Reason:    "低于最低健康节点数",
+			OutputTPS: tps,
+		})
 		_, _ = store.updateNode(nodeID, func(n *nodeRecord) error {
 			n.LastReason = "隔离已抑制: " + reason
 			return nil
@@ -914,7 +943,16 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 		return
 	}
 	store.bumpAction("quarantined")
-	store.appendEvent(guardEvent{Event: "node_quarantined", NodeID: updated.ID, NodeName: updated.Name, Reason: reason, Classification: class, OutputTPS: tps})
+	store.appendEvent(guardEvent{
+		Event:          "node_quarantined",
+		NodeID:         updated.ID,
+		NodeName:       updated.Name,
+		AuthID:         res.AuthID,
+		AuthEmail:      res.AuthEmail,
+		Reason:         reason,
+		Classification: class,
+		OutputTPS:      tps,
+	})
 	// Move accounts off the bad channel synchronously. The first phase disables
 	// them, so no new request can continue using the quarantined egress while
 	// migration and post-save verification are in flight.
@@ -980,6 +1018,8 @@ func runNodeQuality(store *stateStore, id string) (map[string]any, error) {
 		Event:          "quality_probe_completed",
 		NodeID:         id,
 		NodeName:       n.Name,
+		AuthID:         res.AuthID,
+		AuthEmail:      res.AuthEmail,
 		Classification: res.Classification,
 		OutputTPS:      res.TPS,
 		Reason:         res.Error,
@@ -996,6 +1036,8 @@ func runNodeQuality(store *stateStore, id string) (map[string]any, error) {
 		"error":          res.Error,
 		"errorKind":      res.ErrorKind,
 		"model":          res.Model,
+		"authId":         res.AuthID,
+		"authEmail":      res.AuthEmail,
 	}, nil
 }
 
@@ -1094,13 +1136,16 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 		DurationMs:     durMs,
 		FirstTokenMs:   ttftMs,
 		ErrorKind:      errorKind,
+		AuthID:         firstNonEmpty(authID, authIndex),
+		AuthEmail:      firstString(record, "AuthEmail", "auth_email", "Email", "email"),
 	}
 	if nodeID == "" {
 		store.bumpStat("passive", class, outTokens)
 		if class == "hard" || class == "soft" {
 			store.appendEvent(guardEvent{
 				Event:          "unmapped_" + class,
-				AuthID:         firstNonEmpty(authID, authIndex),
+				AuthID:         res.AuthID,
+				AuthEmail:      res.AuthEmail,
 				Classification: class,
 				OutputTPS:      tps,
 				Reason:         fmt.Sprintf("usage 未映射到出口节点 auth=%s idx=%s tokens=%d dur=%dms ttft=%dms", authID, authIndex, outTokens, durMs, ttftMs),
@@ -1137,17 +1182,25 @@ func busiestEnabledNode(store *stateStore) string {
 }
 
 // backgroundWorker periodically probes quarantined / active mode nodes.
+// Scan cadence follows policy.passive_poll_seconds so the UI "审计轮询间隔"
+// actually controls how often the worker wakes.
 func startGuardWorker(ctx context.Context, store *stateStore) {
 	go func() {
-		t := time.NewTicker(30 * time.Second)
-		defer t.Stop()
 		tick := 0
+		timer := time.NewTimer(workerPollInterval(store))
+		defer timer.Stop()
 		for {
 			select {
 			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 				_ = store.Flush()
 				return
-			case <-t.C:
+			case <-timer.C:
 				tick++
 				pol := store.policy()
 				now := float64(time.Now().Unix())
@@ -1170,7 +1223,22 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 				if tick%10 == 0 {
 					refreshAssignedCounts(store)
 				}
+				timer.Reset(workerPollInterval(store))
 			}
 		}
 	}()
+}
+
+func workerPollInterval(store *stateStore) time.Duration {
+	sec := 5
+	if store != nil {
+		sec = store.policy().PassivePollSec
+	}
+	if sec < 1 {
+		sec = 1
+	}
+	if sec > 3600 {
+		sec = 3600
+	}
+	return time.Duration(sec) * time.Second
 }

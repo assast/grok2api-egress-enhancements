@@ -279,11 +279,11 @@
         <div class="modal-body form-grid">
           <div class="field"><label for="policy-mode">模式</label><select id="policy-mode"><option value="hybrid">混合</option><option value="passive">被动</option><option value="active">主动</option></select></div>
           <div class="field"><label for="policy-active">主动检测间隔（秒）</label><input id="policy-active" type="number" min="60" max="86400"></div>
-          <div class="field"><label for="policy-passive">审计轮询间隔（秒）</label><input id="policy-passive" type="number" min="1" max="300"></div>
+          <div class="field"><label for="policy-passive">审计轮询间隔（秒）</label><input id="policy-passive" type="number" min="1" max="3600"><p class="help">后台 worker 扫描/复测节奏</p></div>
           <div class="field"><label for="policy-quarantine">隔离复测间隔（秒）</label><input id="policy-quarantine" type="number" min="30" max="86400"></div>
           <div class="field"><label for="policy-soft">软阈值 Token/s</label><input id="policy-soft" type="number" min="1" max="9999" step="1"></div>
           <div class="field"><label for="policy-hard">硬阈值 Token/s</label><input id="policy-hard" type="number" min="2" max="10000" step="1"></div>
-          <div class="field"><label for="policy-soft-count">软异常计数（仅诊断）</label><input id="policy-soft-count" type="number" min="1" max="20"></div>
+          <div class="field"><label for="policy-soft-count">连续软异常次数</label><input id="policy-soft-count" type="number" min="1" max="20"><p class="help">达到后触发 thinking 复测</p></div>
           <div class="field"><label for="policy-error-count">连续错误次数</label><input id="policy-error-count" type="number" min="1" max="20"></div>
           <div class="field"><label for="policy-min-generation">最短生成窗口（毫秒）</label><input id="policy-min-generation" type="number" min="200" max="10000"></div>
           <div class="field"><label for="policy-min-output">最小判定 Token 数</label><input id="policy-min-output" type="number" min="1" max="10000"></div>
@@ -543,13 +543,18 @@
       const events = state.status?.recentEvents || [];
       if (!events.length) { $('events-list').innerHTML = '<div class="empty">暂无守护事件</div>'; return; }
       const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',soft_quality_probe_scheduled:'已安排 thinking 复测',soft_quality_probe_completed:'thinking 复测完成',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败'};
-      $('events-list').innerHTML = events.slice().reverse().map((event) => '<div class="event"><div><strong>' + esc(names[event.event] || event.event || '守护事件') + ' · ' + esc(event.node_name || ('节点 ' + event.node_id)) + '</strong><small>' + esc(event.reason || event.classification || '-') + (event.output_tps ? ' · ' + Number(event.output_tps).toFixed(1) + ' Token/s' : '') + '</small></div><time>' + relative(event.ts) + '</time></div>').join('');
+      $('events-list').innerHTML = events.slice().reverse().map((event) => {
+        const auth = event.auth_email || event.auth_id || '';
+        const title = esc(names[event.event] || event.event || '守护事件') + ' · ' + esc(event.node_name || (event.node_id ? ('节点 ' + event.node_id) : '未映射'));
+        const detail = esc(event.reason || event.classification || '-') + (auth ? ' · 账号 ' + esc(auth) : '') + (event.output_tps ? ' · ' + Number(event.output_tps).toFixed(1) + ' Token/s' : '');
+        return '<div class="event"><div><strong>' + title + '</strong><small>' + detail + '</small></div><time>' + relative(event.ts) + '</time></div>';
+      }).join('');
     }
     function renderPolicy() {
       const cfg = state.status?.config;
       $('edit-policy').disabled = !cfg;
       if (!cfg) { $('policy-view').innerHTML = '<div class="empty">策略状态不可用</div>'; return; }
-      const values = [['模式',modeName(cfg.mode)],['主动间隔',cfg.active_interval_seconds + ' 秒'],['被动轮询',cfg.passive_poll_seconds + ' 秒'],['软 / 硬阈值',cfg.soft_tps + ' / ' + cfg.hard_tps],['软计数（诊断）/错误次数',cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],['最短生成窗口',(cfg.min_generation_ms || 1000) + ' ms'],['最小判定 Token',cfg.min_output_tokens || 32],['隔离复测',cfg.quarantine_seconds + ' 秒'],['最低健康节点',cfg.min_healthy_nodes],['探测输出',(cfg.max_output_tokens || 384) + ' Token'],['模型',cfg.model],['迁移失败停用',cfg.disable_auth_on_hard ? '是' : '否']];
+      const values = [['模式',modeName(cfg.mode)],['主动间隔',cfg.active_interval_seconds + ' 秒'],['审计轮询',cfg.passive_poll_seconds + ' 秒'],['软 / 硬阈值',cfg.soft_tps + ' / ' + cfg.hard_tps],['软计数 / 错误次数',cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],['最短生成窗口',(cfg.min_generation_ms || 1000) + ' ms'],['最小判定 Token',cfg.min_output_tokens || 32],['隔离复测',cfg.quarantine_seconds + ' 秒'],['最低健康节点',cfg.min_healthy_nodes],['探测输出',(cfg.max_output_tokens || 384) + ' Token'],['模型',cfg.model],['迁移失败停用',cfg.disable_auth_on_hard ? '是' : '否']];
       $('policy-view').innerHTML = values.map((value) => '<div><dt>' + value[0] + '</dt><dd>' + esc(value[1]) + '</dd></div>').join('');
     }
     function openModal(id) { $(id).hidden = false; document.body.style.overflow = 'hidden'; $(id).querySelector('input,select,textarea,button')?.focus(); }
