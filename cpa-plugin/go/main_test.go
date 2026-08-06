@@ -155,7 +155,7 @@ func TestProbeQualityUsesPromptAndKeywordRetry(t *testing.T) {
 		invalidateAuthListCache()
 	}()
 
-	result := probeQuality(s, &nodeRecord{ProxyURL: proxy.URL})
+	result := probeQuality(s, &nodeRecord{ProxyURL: proxy.URL, Enabled: true})
 	if result.Classification != "healthy" || result.AuthID != "second.json" {
 		t.Fatalf("probe result=%+v, want healthy result from second account", result)
 	}
@@ -1117,5 +1117,244 @@ func TestPolicyAcceptsProbePromptAndRetryKeywords(t *testing.T) {
 	}
 	if got, want := strings.Join(pol.ProbeRetryKeywords, "|"), "rotate-me|AUTH-FAIL"; got != want {
 		t.Fatalf("probe retry keywords=%q, want %q", got, want)
+	}
+}
+
+func installAuthFixture(t *testing.T, auths map[string]map[string]any) {
+	t.Helper()
+	originalHostCall := hostCall
+	invalidateAuthListCache()
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			entries := make([]pluginapi.HostAuthFileEntry, 0, len(auths))
+			for name, raw := range auths {
+				disabled, _ := raw["disabled"].(bool)
+				entries = append(entries, pluginapi.HostAuthFileEntry{
+					ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai", Disabled: disabled,
+				})
+			}
+			return json.Marshal(hostAuthListResponse{Files: entries})
+		case pluginabi.MethodHostAuthGet:
+			var request map[string]string
+			if err := json.Unmarshal(payload, &request); err != nil {
+				return nil, err
+			}
+			name := request["auth_index"]
+			if name == "" {
+				name = request["name"]
+			}
+			raw, ok := auths[name]
+			if !ok {
+				return nil, fmt.Errorf("auth not found: %s", name)
+			}
+			body, _ := json.Marshal(raw)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: name, Name: name, Path: "/auths/" + name, JSON: body})
+		case pluginabi.MethodHostAuthSave:
+			var request struct {
+				Name string          `json:"name"`
+				JSON json.RawMessage `json:"json"`
+			}
+			if err := json.Unmarshal(payload, &request); err != nil {
+				return nil, err
+			}
+			updated := map[string]any{}
+			if err := json.Unmarshal(request.JSON, &updated); err != nil {
+				return nil, err
+			}
+			auths[request.Name] = updated
+			return json.Marshal(pluginapi.HostAuthSaveResponse{Name: request.Name, Path: "/auths/" + request.Name})
+		default:
+			return nil, fmt.Errorf("unexpected host callback %s", method)
+		}
+	}
+	t.Cleanup(func() {
+		hostCall = originalHostCall
+		invalidateAuthListCache()
+		invalidateAuthProxyCache()
+	})
+}
+
+func managementStatus(t *testing.T, raw []byte) int {
+	t.Helper()
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	var response managementResponse
+	if err := json.Unmarshal(env.Result, &response); err != nil {
+		t.Fatal(err)
+	}
+	return response.StatusCode
+}
+
+func TestDisablingNodeReconcilesAccountsAndPreservesDisabledState(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	source, err := store.createNode("source", "http://127.0.0.1:7961", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := store.createNode("target", "http://127.0.0.1:7962", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"active.json": {
+			"type": "xai", "access_token": "active-token", "proxy_url": source.ProxyURL, "disabled": false,
+		},
+		"manual.json": {
+			"type": "xai", "access_token": "manual-token", "proxy_url": source.ProxyURL,
+			"disabled": true, "disabled_reason": "operator maintenance", "custom": "keep",
+		},
+	}
+	installAuthFixture(t, auths)
+
+	body, _ := json.Marshal(map[string]any{"enabled": false})
+	response, err := dispatchAPI(http.MethodPatch, "/nodes/"+source.ID, nil, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := managementStatus(t, response); got != http.StatusOK {
+		t.Fatalf("disable status=%d, want %d", got, http.StatusOK)
+	}
+	if node, _ := store.getNode(source.ID); node.Enabled {
+		t.Fatal("source node remains enabled")
+	}
+	if got := auths["active.json"]["proxy_url"]; got != target.ProxyURL {
+		t.Fatalf("active account proxy=%q, want %q", got, target.ProxyURL)
+	}
+	if got := auths["manual.json"]["proxy_url"]; got != target.ProxyURL {
+		t.Fatalf("disabled account proxy=%q, want %q", got, target.ProxyURL)
+	}
+	if disabled, _ := auths["manual.json"]["disabled"].(bool); !disabled {
+		t.Fatal("disabled account was re-enabled")
+	}
+	if reason := auths["manual.json"]["disabled_reason"]; reason != "operator maintenance" {
+		t.Fatalf("disabled reason=%q, want preserved reason", reason)
+	}
+	if custom := auths["manual.json"]["custom"]; custom != "keep" {
+		t.Fatalf("custom auth field=%q, want preserved field", custom)
+	}
+
+	// Repeating an explicit disable is idempotent and must not rebind accounts
+	// back to the disabled source node.
+	response, err = dispatchAPI(http.MethodPatch, "/nodes/"+source.ID, nil, body)
+	if err != nil || managementStatus(t, response) != http.StatusOK {
+		t.Fatalf("repeated disable failed: err=%v status=%d", err, managementStatus(t, response))
+	}
+}
+
+func TestBatchDisablingNodesDoesNotMigrateIntoBatch(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	first, err := store.createNode("first", "http://127.0.0.1:7971", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.createNode("second", "http://127.0.0.1:7972", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := store.createNode("target", "http://127.0.0.1:7973", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"first.json":  {"type": "xai", "access_token": "first-token", "proxy_url": first.ProxyURL, "disabled": false},
+		"second.json": {"type": "xai", "access_token": "second-token", "proxy_url": second.ProxyURL, "disabled": false},
+	}
+	installAuthFixture(t, auths)
+
+	body, _ := json.Marshal(map[string]any{"ids": []string{first.ID, second.ID}, "enabled": false})
+	response, err := dispatchAPI(http.MethodPatch, "/nodes/batch", nil, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := managementStatus(t, response); got != http.StatusOK {
+		t.Fatalf("batch disable status=%d, want %d", got, http.StatusOK)
+	}
+	if got := auths["first.json"]["proxy_url"]; got != target.ProxyURL {
+		t.Fatalf("first account proxy=%q, want %q", got, target.ProxyURL)
+	}
+	if got := auths["second.json"]["proxy_url"]; got != target.ProxyURL {
+		t.Fatalf("second account proxy=%q, want %q", got, target.ProxyURL)
+	}
+}
+
+func TestDisablingLastNodeUnbindsAccounts(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	source, err := store.createNode("source", "http://127.0.0.1:7981", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"active.json": {
+			"type": "xai", "access_token": "active-token", "proxy_url": source.ProxyURL, "disabled": false,
+		},
+		"disabled.json": {
+			"type": "xai", "access_token": "disabled-token", "proxy_url": source.ProxyURL, "disabled": true,
+		},
+	}
+	installAuthFixture(t, auths)
+
+	body, _ := json.Marshal(map[string]any{"enabled": false})
+	response, err := dispatchAPI(http.MethodPatch, "/nodes/"+source.ID, nil, body)
+	if err != nil || managementStatus(t, response) != http.StatusOK {
+		t.Fatalf("disable last node failed: err=%v status=%d", err, managementStatus(t, response))
+	}
+	for name, raw := range auths {
+		if _, ok := raw["proxy_url"]; ok {
+			t.Errorf("%s remains bound: %v", name, raw["proxy_url"])
+		}
+	}
+	if disabled, _ := auths["disabled.json"]["disabled"].(bool); !disabled {
+		t.Fatal("disabled account was re-enabled while unbinding")
+	}
+}
+
+func TestDisabledNodeBorrowsOnlyRandomNormalAccounts(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	auths := map[string]map[string]any{
+		"normal-a.json": {"type": "xai", "access_token": "a-token", "proxy_url": "http://127.0.0.1:7991", "disabled": false},
+		"normal-b.json": {"type": "xai", "access_token": "b-token", "proxy_url": "http://127.0.0.1:7992", "disabled": false},
+		"disabled.json": {"type": "xai", "access_token": "disabled-token", "proxy_url": "http://127.0.0.1:7993", "disabled": true},
+		"expired.json":  {"type": "xai", "access_token": "expired-token", "proxy_url": "http://127.0.0.1:7994", "disabled": false, "expired": time.Now().Add(-time.Hour).Format(time.RFC3339)},
+		"empty.json":    {"type": "xai", "access_token": "", "proxy_url": "http://127.0.0.1:7995", "disabled": false},
+	}
+	installAuthFixture(t, auths)
+
+	candidates, err := listAuthsForNode(&nodeRecord{ProxyURL: "http://127.0.0.1:7999", Enabled: false}, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 2 {
+		t.Fatalf("candidate count=%d, want 2", len(candidates))
+	}
+	for _, candidate := range candidates {
+		if candidate.Name != "normal-a.json" && candidate.Name != "normal-b.json" {
+			t.Fatalf("unexpected borrowed candidate %q", candidate.Name)
+		}
+	}
+	for name, raw := range auths {
+		if name == "normal-a.json" || name == "normal-b.json" {
+			continue
+		}
+		if raw["proxy_url"] == nil {
+			t.Fatalf("fixture proxy unexpectedly changed for %s", name)
+		}
+	}
+}
+
+func TestNoNormalAccountReturnsNoAccountError(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	auths := map[string]map[string]any{
+		"disabled.json": {"type": "xai", "access_token": "disabled-token", "disabled": true},
+		"expired.json":  {"type": "xai", "access_token": "expired-token", "disabled": false, "expired": time.Now().Add(-time.Hour).Format(time.RFC3339)},
+		"empty.json":    {"type": "xai", "access_token": "", "disabled": false},
+	}
+	installAuthFixture(t, auths)
+
+	_, err := listAuthsForNode(&nodeRecord{ProxyURL: "http://127.0.0.1:8001", Enabled: false}, 1)
+	if err == nil || err.Error() != "没有可用的 CPA xAI 账号" {
+		t.Fatalf("error=%v, want no-account error", err)
 	}
 }

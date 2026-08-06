@@ -492,7 +492,14 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			_ = json.Unmarshal(body, &raw)
 			ids := stringIDs(raw["ids"])
 			if v, ok := raw["enabled"].(bool); ok {
-				_ = store.setBatchEnabled(ids, v)
+				if err := store.setBatchEnabled(ids, v); err != nil {
+					return managementJSON(http.StatusBadRequest, errMsg("updateFailed", err.Error()))
+				}
+				if !v {
+					if err := reconcileDisabledNodeIDs(store, ids); err != nil {
+						return managementJSON(http.StatusBadRequest, errMsg("accountReconcileFailed", err.Error()))
+					}
+				}
 			}
 			return managementJSON(http.StatusOK, map[string]any{"ok": true})
 		}
@@ -588,12 +595,14 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 		if method == http.MethodPut || method == http.MethodPatch {
 			var raw map[string]any
 			_ = json.Unmarshal(body, &raw)
+			disableRequested := false
 			n, err := store.updateNode(id, func(node *nodeRecord) error {
 				if v, ok := raw["name"].(string); ok && strings.TrimSpace(v) != "" {
 					node.Name = strings.TrimSpace(v)
 				}
 				if v, ok := raw["enabled"].(bool); ok {
 					node.Enabled = v
+					disableRequested = !v
 				}
 				if v, ok := raw["proxyPool"].(bool); ok {
 					node.ProxyPool = v
@@ -615,6 +624,11 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			})
 			if err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("updateFailed", err.Error()))
+			}
+			if disableRequested {
+				if err := reconcileDisabledNodeAccounts(store, n); err != nil {
+					return managementJSON(http.StatusBadRequest, errMsg("accountReconcileFailed", err.Error()))
+				}
 			}
 			return managementJSON(http.StatusOK, map[string]any{"data": publicNode(n)})
 		}

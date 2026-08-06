@@ -268,15 +268,33 @@ func saveAuthFile(name string, obj map[string]any) error {
 	return err
 }
 
+func updateAuthProxyRaw(raw map[string]any, proxyURL string) {
+	if proxyURL == "" {
+		delete(raw, "proxy_url")
+	} else {
+		raw["proxy_url"] = proxyURL
+	}
+}
+
+// setAuthProxy changes only the binding field and preserves the account's
+// disabled state/reason. It is used when a management operation moves or
+// unbinds an account without changing its lifecycle state.
+func setAuthProxy(a authFile, proxyURL string) error {
+	if a.Raw == nil {
+		a.Raw = map[string]any{}
+	}
+	updateAuthProxyRaw(a.Raw, proxyURL)
+	if _, ok := a.Raw["type"]; !ok {
+		a.Raw["type"] = "xai"
+	}
+	return saveAuthFile(a.Name, a.Raw)
+}
+
 func setAuthProxyAndFlags(a authFile, proxyURL string, disabled bool, reason string) error {
 	if a.Raw == nil {
 		a.Raw = map[string]any{}
 	}
-	if proxyURL == "" {
-		delete(a.Raw, "proxy_url")
-	} else {
-		a.Raw["proxy_url"] = proxyURL
-	}
+	updateAuthProxyRaw(a.Raw, proxyURL)
 	a.Raw["disabled"] = disabled
 	if disabled && reason != "" {
 		a.Raw["disabled_reason"] = reason
@@ -425,6 +443,103 @@ func refreshAssignedCounts(store *stateStore) {
 	store.setAssignedCounts(counts)
 }
 
+func disabledNodeMigrationTargets(store *stateStore, source *nodeRecord) []*nodeRecord {
+	if store == nil || source == nil {
+		return nil
+	}
+	targets := make([]*nodeRecord, 0)
+	for _, node := range store.listNodes() {
+		if node.ID == source.ID || !node.Enabled || node.DisabledByGuard || node.ProxyURL == "" || node.ProxyURL == source.ProxyURL {
+			continue
+		}
+		targets = append(targets, node)
+	}
+	return targets
+}
+
+// reconcileDisabledNodeAccountsWithAuths removes every account from a
+// management-disabled node using a caller-provided snapshot. It prefers
+// currently schedulable nodes and falls back to clearing proxy_url when no
+// such node exists. Account lifecycle flags are intentionally left untouched.
+func reconcileDisabledNodeAccountsWithAuths(store *stateStore, source *nodeRecord, auths []authFile) error {
+	if store == nil || source == nil || source.Enabled || source.ProxyURL == "" {
+		return nil
+	}
+	targets := disabledNodeMigrationTargets(store, source)
+	failed := make([]string, 0)
+	cursor := 0
+	for _, auth := range auths {
+		if auth.ProxyURL != source.ProxyURL {
+			continue
+		}
+		expectedProxy := ""
+		if len(targets) > 0 {
+			expectedProxy = targets[cursor%len(targets)].ProxyURL
+			cursor++
+		}
+		if saveErr := setAuthProxy(auth, expectedProxy); saveErr != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", auth.Name, saveErr))
+			continue
+		}
+		if verifyErr := verifyAuthBinding(auth, expectedProxy, auth.Disabled); verifyErr != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", auth.Name, verifyErr))
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("停用节点账号收敛失败: %s", strings.Join(failed, "; "))
+	}
+	return nil
+}
+
+func reconcileDisabledNodeAccounts(store *stateStore, source *nodeRecord) error {
+	if store == nil || source == nil || source.Enabled || source.ProxyURL == "" {
+		return nil
+	}
+	auths, err := listAuthFilesFresh()
+	if err != nil {
+		return err
+	}
+	err = reconcileDisabledNodeAccountsWithAuths(store, source, auths)
+	refreshAssignedCounts(store)
+	return err
+}
+
+func reconcileDisabledNodeIDs(store *stateStore, ids []string) error {
+	if store == nil {
+		return nil
+	}
+	disabledNodes := make([]*nodeRecord, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		node, ok := store.getNode(id)
+		if ok && !node.Enabled {
+			disabledNodes = append(disabledNodes, node)
+		}
+	}
+	if len(disabledNodes) == 0 {
+		return nil
+	}
+	auths, err := listAuthFilesFresh()
+	if err != nil {
+		return err
+	}
+	failed := make([]string, 0)
+	for _, node := range disabledNodes {
+		if err := reconcileDisabledNodeAccountsWithAuths(store, node, auths); err != nil {
+			failed = append(failed, fmt.Sprintf("节点 %s: %v", node.ID, err))
+		}
+	}
+	refreshAssignedCounts(store)
+	if len(failed) > 0 {
+		return fmt.Errorf("停用节点账号收敛失败: %s", strings.Join(failed, "; "))
+	}
+	return nil
+}
+
 func disableAuthsOnNode(store *stateStore, node *nodeRecord, reason string) error {
 	if node == nil || node.ProxyURL == "" {
 		return nil
@@ -473,8 +588,24 @@ func pickAuthForNode(node *nodeRecord) (authFile, error) {
 	return list[0], nil
 }
 
-// listAuthsForNode returns up to limit enabled xAI auths bound to the node proxy,
-// preferring non-expired tokens. Falls back to any enabled xAI auth if none bound.
+func normalAuthPool(auths []authFile) []authFile {
+	pool := make([]authFile, 0, len(auths))
+	for _, auth := range auths {
+		if auth.Disabled {
+			continue
+		}
+		token, _ := auth.Raw["access_token"].(string)
+		if strings.TrimSpace(token) == "" || isAuthExpired(auth) {
+			continue
+		}
+		pool = append(pool, auth)
+	}
+	return pool
+}
+
+// listAuthsForNode returns up to limit normal xAI auths bound to an enabled,
+// non-quarantined node. When no usable binding exists, it borrows from the
+// global normal pool in random order without changing proxy_url.
 func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 	if limit <= 0 {
 		limit = 5
@@ -483,22 +614,10 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	var primary, fallback, expired []authFile
-	for _, a := range auths {
-		if a.Disabled {
-			continue
-		}
-		tok, _ := a.Raw["access_token"].(string)
-		if strings.TrimSpace(tok) == "" {
-			continue
-		}
-		onNode := node != nil && node.ProxyURL != "" && a.ProxyURL == node.ProxyURL
-		if isAuthExpired(a) {
-			if onNode {
-				expired = append(expired, a)
-			}
-			continue
-		}
+	boundNode := node != nil && node.Enabled && !node.DisabledByGuard && node.ProxyURL != ""
+	var primary, fallback []authFile
+	for _, a := range normalAuthPool(auths) {
+		onNode := boundNode && a.ProxyURL == node.ProxyURL
 		if onNode {
 			primary = append(primary, a)
 		} else {
@@ -507,12 +626,8 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 	}
 	out := make([]authFile, 0, limit)
 	out = append(out, primary...)
-	// If node has no fresh bound auth, still try expired bound ones before foreign auths
-	// so quality probe still pins to the channel when possible.
-	if len(out) == 0 {
-		out = append(out, expired...)
-	}
 	if len(out) < limit {
+		rand.Shuffle(len(fallback), func(i, j int) { fallback[i], fallback[j] = fallback[j], fallback[i] })
 		out = append(out, fallback...)
 	}
 	if len(out) > limit {
@@ -524,9 +639,9 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 	return out, nil
 }
 
-// listAnyAuthsForIsolationRetest returns up to limit enabled xAI accounts that
-// still have an access_token, in random order. Isolation retests must respect
-// the account-level disabled flag even when the node itself is quarantined.
+// listAnyAuthsForIsolationRetest returns up to limit normal xAI accounts in
+// random order. Isolation retests must respect the account-level disabled flag
+// even when the node itself is quarantined.
 func listAnyAuthsForIsolationRetest(limit int) ([]authFile, error) {
 	if limit <= 0 {
 		limit = 1
@@ -535,17 +650,7 @@ func listAnyAuthsForIsolationRetest(limit int) ([]authFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	pool := make([]authFile, 0, len(auths))
-	for _, a := range auths {
-		if a.Disabled {
-			continue
-		}
-		tok, _ := a.Raw["access_token"].(string)
-		if strings.TrimSpace(tok) == "" {
-			continue
-		}
-		pool = append(pool, a)
-	}
+	pool := normalAuthPool(auths)
 	if len(pool) == 0 {
 		return nil, fmt.Errorf("没有可用的 CPA xAI 账号")
 	}
