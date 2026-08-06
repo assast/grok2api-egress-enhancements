@@ -351,6 +351,54 @@ func TestWorkerPollIntervalUsesPassivePollSeconds(t *testing.T) {
 	}
 }
 
+func TestUpdatingQuarantineSecondsReschedulesExistingQuarantinedNodes(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	quarantined, err := s.createNode("quarantined", "http://127.0.0.1:7956", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthy, err := s.createNode("healthy", "http://127.0.0.1:7957", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldUntil := float64(time.Now().Add(-time.Minute).Unix())
+	if _, err := s.updateNode(quarantined.ID, func(node *nodeRecord) error {
+		node.DisabledByGuard = true
+		node.QuarantinedUntil = oldUntil
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pol := s.policy()
+	pol.QuarantineSec = 3600
+	if err := s.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+
+	current, _ := s.getNode(quarantined.ID)
+	minimumUntil := float64(time.Now().Add(3590 * time.Second).Unix())
+	if current.QuarantinedUntil < minimumUntil {
+		t.Fatalf("quarantine deadline=%v, want at least ~3600 seconds from now", current.QuarantinedUntil)
+	}
+	if current.QuarantinedUntil == oldUntil {
+		t.Fatal("quarantine deadline was not updated")
+	}
+	untouched, _ := s.getNode(healthy.ID)
+	if untouched.DisabledByGuard || untouched.QuarantinedUntil != 0 {
+		t.Fatalf("healthy node changed during policy update: %+v", untouched)
+	}
+
+	deadline := current.QuarantinedUntil
+	if err := s.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	current, _ = s.getNode(quarantined.ID)
+	if current.QuarantinedUntil != deadline {
+		t.Fatalf("saving unchanged policy moved deadline from %v to %v", deadline, current.QuarantinedUntil)
+	}
+}
+
 func TestQuarantinedNoAccountSchedulesNextRetest(t *testing.T) {
 	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	node, err := s.createNode("Node 040", "http://127.0.0.1:7951", true, false, 0)

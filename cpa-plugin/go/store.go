@@ -384,6 +384,17 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 	if p.MaxOutputTokensProbe < 16 || p.MaxOutputTokensProbe > 4096 {
 		return fmt.Errorf("主动探测最大输出需在 16 到 4096 Token 之间")
 	}
+	if s.data.Policy.QuarantineSec != p.QuarantineSec {
+		now := time.Now()
+		nextRetest := float64(now.Add(time.Duration(p.QuarantineSec) * time.Second).Unix())
+		for _, n := range s.data.Nodes {
+			if !n.DisabledByGuard {
+				continue
+			}
+			n.QuarantinedUntil = nextRetest
+			n.UpdatedAt = now.UTC()
+		}
+	}
 	s.data.Policy = p
 	return s.persistLocked()
 }
