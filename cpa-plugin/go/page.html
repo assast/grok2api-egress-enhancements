@@ -54,6 +54,7 @@
     .toolbar { flex-wrap: wrap; justify-content: flex-end; }
     .search { width: min(16rem, 100%); }
     .status-filter { width: min(10rem, 100%); }
+    .filter-summary { color: var(--muted-foreground); font-size: var(--text-2xs); white-space: nowrap; }
     input, select, textarea { min-height: 2.25rem; width: 100%; border: var(--rule-hairline) solid var(--input); border-radius: var(--radius-sm); padding: 0 var(--space-xs); background: var(--background); color: var(--foreground); }
     textarea { min-height: 14rem; resize: vertical; padding: var(--space-xs); font-family: var(--font-mono); font-size: var(--text-xs); line-height: 1.6; }
     input:hover, select:hover, textarea:hover { border-color: var(--ring); }
@@ -211,6 +212,9 @@
             <option value="disabled">已停用</option>
             <option value="pending">待检测</option>
           </select>
+          <button id="dedupe-exit-ip" class="button" type="button" title="按当前筛选结果的出口 IP 删除重复节点">按出口 IP 剔重</button>
+          <button id="export-nodes" class="button" type="button" title="导出当前筛选结果中的代理链接" disabled>导出节点</button>
+          <span id="node-result-summary" class="filter-summary" aria-live="polite">当前结果 0 个</span>
           <button id="rebalance-nodes" class="button" type="button" title="按启用节点把 CPA 账号 proxy_url 重新均分">重平衡账号</button>
           <button id="bulk-add-node" class="button" type="button">批量添加</button>
           <button id="add-node" class="button primary" type="button">添加节点</button>
@@ -455,6 +459,17 @@
         return matchesQuery && matchesStatus;
       });
     }
+    function duplicateNodesByExitIP(nodes) {
+      const seen = new Set();
+      return nodes.filter((node) => {
+        const exitIP = String(node.exitIp || '').trim().toLowerCase();
+        if (!exitIP || !seen.has(exitIP)) {
+          if (exitIP) seen.add(exitIP);
+          return false;
+        }
+        return true;
+      });
+    }
     function nodeGuard(node) { return state.status?.nodes?.[node.id] || {}; }
     function nodeStatusKey(node, guard) {
       if (guard.disabled_by_guard) return 'quarantined';
@@ -507,6 +522,8 @@
     }
     function renderNodes() {
       const nodes = filteredNodes();
+      $('node-result-summary').textContent = '当前结果 ' + number(nodes.length) + ' 个';
+      $('export-nodes').disabled = nodes.length === 0;
       $('batch-bar').hidden = state.selected.size === 0;
       $('batch-count').textContent = '已选择 ' + state.selected.size + ' 个节点';
       $('select-all').checked = nodes.length > 0 && nodes.every((node) => state.selected.has(node.id));
@@ -669,6 +686,41 @@
     async function testConnectivity(ids, button) {
       await mutate(button, () => api('/nodes/test', {method:'POST', body:{ids}}), '连通性检测完成');
     }
+    async function exportNodes(button) {
+      const nodes = filteredNodes();
+      if (!nodes.length) {
+        toast('当前筛选条件下没有可导出的节点', 'error');
+        return;
+      }
+      busy(button, true);
+      try {
+        const result = await api('/nodes/export', {method:'POST', body:{ids:nodes.map((node) => node.id)}});
+        const content = typeof result?.content === 'string' ? result.content : '';
+        const count = Number(result?.count || 0);
+        if (!content.trim() || count <= 0) {
+          toast('当前筛选条件下没有可导出的节点', 'error');
+          return;
+        }
+        const blobURL = URL.createObjectURL(new Blob([content], {type:'text/plain;charset=utf-8'}));
+        const link = document.createElement('a');
+        link.href = blobURL;
+        link.download = 'egress-proxies.txt';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(blobURL);
+        toast('已导出 ' + count + ' 个代理链接');
+      } catch (error) { toast(error.message, 'error'); }
+      finally { busy(button, false); }
+    }
+    function dedupeNodes(button) {
+      const duplicates = duplicateNodesByExitIP(filteredNodes());
+      if (!duplicates.length) {
+        toast('当前筛选条件下没有重复出口 IP');
+        return;
+      }
+      confirmAction('按出口 IP 剔重', '将删除当前筛选结果中 ' + duplicates.length + ' 个重复节点，保留每个出口 IP 当前顺序的第一条。已绑定账号会随节点删除而解绑。', (confirmButton) => deleteNodes(duplicates.map((node) => node.id), confirmButton));
+    }
 
     async function showAccounts(node, button) {
       $('accounts-modal-title').textContent = node.name + ' · 绑定账号';
@@ -706,6 +758,8 @@
     });
     $('node-search').addEventListener('input', (event) => { state.search = event.target.value; renderNodes(); });
     $('node-status-filter').addEventListener('change', (event) => { state.statusFilter = event.target.value; renderNodes(); });
+    $('dedupe-exit-ip').addEventListener('click', (event) => dedupeNodes(event.currentTarget));
+    $('export-nodes').addEventListener('click', (event) => exportNodes(event.currentTarget));
     $('add-node').addEventListener('click', () => openNode());
     $('bulk-add-node').addEventListener('click', () => openModal('bulk-node-modal'));
     $('bulk-node-input').addEventListener('input', (event) => {

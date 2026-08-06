@@ -415,6 +415,32 @@ func (s *stateStore) getNode(id string) (*nodeRecord, bool) {
 	return &cp, true
 }
 
+func (s *stateStore) proxyURLs(ids []string) []string {
+	if s == nil || len(ids) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := make(map[string]struct{}, len(ids))
+	urls := make([]string, 0, len(ids))
+	for _, rawID := range ids {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		n, ok := s.data.Nodes[id]
+		if !ok || strings.TrimSpace(n.ProxyURL) == "" {
+			continue
+		}
+		urls = append(urls, n.ProxyURL)
+	}
+	return urls
+}
+
 func (s *stateStore) createNode(name, proxyURL string, enabled, pool bool, capacity int) (*nodeRecord, error) {
 	created, err := s.createNodes([]nodeCreateInput{{
 		Name:            name,

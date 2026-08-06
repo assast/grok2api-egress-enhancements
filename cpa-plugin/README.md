@@ -314,6 +314,7 @@ Content-Type: application/json
 | `/policy` | GET/PUT | 读写守护策略 |
 | `/nodes` | GET/POST/DELETE | 列表 / 创建 / 批量删 |
 | `/nodes/import` | POST | 原子批量创建 1-500 个节点；代理 URL 不回显 |
+| `/nodes/export` | POST | 按节点 ID 顺序导出代理 URL；单次 1-500 个，普通列表仍脱敏 |
 | `/nodes/batch` | PATCH | 批量启停 |
 | `/nodes/test` | POST | 批量连通测试 |
 | `/nodes/rebalance` | POST | 账号重平衡 |

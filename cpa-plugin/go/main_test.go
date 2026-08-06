@@ -651,7 +651,7 @@ func TestStoreCreateNodesIsAllOrNothing(t *testing.T) {
 
 func TestRenderStatusPage(t *testing.T) {
 	page := strings.Replace(pageTemplate, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
-	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "批量添加", "/nodes/import", "页面每 15 秒刷新", "node-status-filter", "全部状态", "nodeStatusKey", "最短生成窗口", "policy-retry-keywords", "policy-prompt", "X-Grok2API-Egress-UI"} {
+	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "批量添加", "/nodes/import", "/nodes/export", "页面每 15 秒刷新", "node-status-filter", "全部状态", "nodeStatusKey", "dedupe-exit-ip", "按出口 IP 剔重", "duplicateNodesByExitIP", "export-nodes", "egress-proxies.txt", "当前结果", "已绑定账号会随节点删除而解绑", "最短生成窗口", "policy-retry-keywords", "policy-prompt", "X-Grok2API-Egress-UI"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("missing %q", want)
 		}
@@ -692,6 +692,69 @@ func TestDispatchNodesList(t *testing.T) {
 	}
 	if !strings.Contains(string(resp.Body), `"name":"a"`) {
 		t.Fatalf("body %s", resp.Body)
+	}
+}
+
+func TestDispatchNodesExportUsesRequestedOrderAndKeepsListRedacted(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
+	first, err := store.createNode("first", "http://user:first@127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.createNode("second", "socks5h://user:second@127.0.0.1:7952", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headers := make(http.Header)
+	headers.Set("X-Grok2API-Egress-UI", "1")
+	call := func(method, path string, payload any) managementResponse {
+		rawBody, _ := json.Marshal(payload)
+		requestBody, _ := json.Marshal(uiProxyRequest{Method: method, Path: path, Body: rawBody})
+		raw, callErr := handleUIProxy(managementRequest{Method: http.MethodPost, Headers: headers, Body: requestBody})
+		if callErr != nil {
+			t.Fatal(callErr)
+		}
+		var env envelope
+		if err := json.Unmarshal(raw, &env); err != nil {
+			t.Fatal(err)
+		}
+		var response managementResponse
+		if err := json.Unmarshal(env.Result, &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+
+	response := call(http.MethodPost, "/nodes/export", map[string]any{
+		"ids": []string{second.ID, first.ID, second.ID, "missing"},
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("export status=%d body=%s", response.StatusCode, response.Body)
+	}
+	var exported struct {
+		Data struct {
+			Content string `json:"content"`
+			Count   int    `json:"count"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body, &exported); err != nil {
+		t.Fatal(err)
+	}
+	wantContent := "socks5h://user:second@127.0.0.1:7952\nhttp://user:first@127.0.0.1:7951\n"
+	if exported.Data.Content != wantContent || exported.Data.Count != 2 {
+		t.Fatalf("export=%+v, want content %q and count 2", exported.Data, wantContent)
+	}
+
+	list := call(http.MethodGet, "/nodes", nil)
+	if list.StatusCode != http.StatusOK || strings.Contains(string(list.Body), "user:first") || strings.Contains(string(list.Body), "user:second") {
+		t.Fatalf("node list leaked proxy URL: status=%d body=%s", list.StatusCode, list.Body)
+	}
+
+	for _, ids := range []any{[]string{}, make([]string, 501)} {
+		invalid := call(http.MethodPost, "/nodes/export", map[string]any{"ids": ids})
+		if invalid.StatusCode != http.StatusBadRequest || strings.Contains(string(invalid.Body), "user:") {
+			t.Fatalf("invalid export status=%d body=%s", invalid.StatusCode, invalid.Body)
+		}
 	}
 }
 

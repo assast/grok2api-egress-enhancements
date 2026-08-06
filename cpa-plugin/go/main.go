@@ -461,6 +461,31 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			return managementJSON(http.StatusOK, map[string]any{"ok": true, "deleted": len(ids)})
 		}
 
+	case path == "/nodes/export":
+		if method != http.MethodPost {
+			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(body, &raw); err != nil {
+			return managementJSON(http.StatusBadRequest, errMsg("invalidBody", "导出节点数据无效"))
+		}
+		ids := stringIDs(raw["ids"])
+		if len(ids) == 0 || len(ids) > 500 {
+			return managementJSON(http.StatusBadRequest, errMsg("invalidBody", "导出节点数量需在 1 到 500 个之间"))
+		}
+		for _, id := range ids {
+			if strings.TrimSpace(id) == "" {
+				return managementJSON(http.StatusBadRequest, errMsg("invalidBody", "节点 ID 不能为空"))
+			}
+		}
+		urls := store.proxyURLs(ids)
+		content := strings.Join(urls, "\n")
+		if content != "" {
+			content += "\n"
+		}
+		result := map[string]any{"content": content, "count": len(urls)}
+		return managementJSON(http.StatusOK, map[string]any{"data": result, "content": content, "count": len(urls)})
+
 	case path == "/nodes/batch":
 		if method == http.MethodPatch || method == http.MethodPost {
 			var raw map[string]any
