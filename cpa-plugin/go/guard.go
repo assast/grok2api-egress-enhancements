@@ -248,6 +248,27 @@ func probeConnectivity(proxyURL string) (exitIP string, latencyMs int64, err err
 
 var probeConnectivityFn = probeConnectivity
 
+const (
+	qualityTriggerManual    = "manual"
+	qualityTriggerScheduled = "scheduled"
+	qualityTriggerAutomatic = "automatic"
+)
+
+// qualityEventTrigger keeps the quality source (active/passive) separate from
+// how the observation was started (manual, scheduled, or automatic).
+func qualityEventTrigger(source string, requested ...string) string {
+	if len(requested) > 0 {
+		switch strings.ToLower(strings.TrimSpace(requested[0])) {
+		case qualityTriggerManual, qualityTriggerScheduled, qualityTriggerAutomatic:
+			return strings.ToLower(strings.TrimSpace(requested[0]))
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(source), "passive") {
+		return qualityTriggerAutomatic
+	}
+	return qualityTriggerScheduled
+}
+
 type qualityResult struct {
 	Classification string  `json:"classification"`
 	TPS            float64 `json:"tps"`
@@ -418,7 +439,7 @@ func rotationAllowed(cfg pluginConfig, nodeID string) bool {
 	return false
 }
 
-func rotateNodeIfConfigured(store *stateStore, node *nodeRecord) (bool, error) {
+func rotateNodeIfConfigured(store *stateStore, node *nodeRecord, triggerInfo ...string) (bool, error) {
 	if node == nil {
 		return false, nil
 	}
@@ -475,7 +496,7 @@ func rotateNodeIfConfigured(store *stateStore, node *nodeRecord) (bool, error) {
 	if err != nil || updated == nil {
 		return false, fmt.Errorf("保存换 IP 状态失败")
 	}
-	store.appendEvent(guardEvent{Event: "node_rotated", NodeID: node.ID, NodeName: node.Name, Source: "active", Reason: "Webhook 已确认出口 IP 变化"})
+	store.appendEvent(guardEvent{Event: "node_rotated", NodeID: node.ID, NodeName: node.Name, Source: "active", Trigger: qualityEventTrigger("active", triggerInfo...), Reason: "Webhook 已确认出口 IP 变化"})
 	return true, nil
 }
 
@@ -840,6 +861,7 @@ func scheduleSoftQualityProbe(store *stateStore, nodeID, nodeName string, trigge
 		NodeID:          nodeID,
 		NodeName:        nodeName,
 		Source:          "passive",
+		Trigger:         qualityTriggerScheduled,
 		AuthID:          trigger.AuthID,
 		AuthEmail:       trigger.AuthEmail,
 		Reason:          softProbeReason(softStrikes, softLimit, qualityResult{}),
@@ -856,12 +878,13 @@ func scheduleSoftQualityProbe(store *stateStore, nodeID, nodeName string, trigge
 		if res.Classification == "error" && res.ErrorKind != "transport_error" {
 			res.Classification = "ignored"
 		}
-		applyObservation(store, nodeID, "active", res)
+		applyObservation(store, nodeID, "active", res, qualityTriggerScheduled)
 		store.appendEvent(guardEvent{
 			Event:           "soft_quality_probe_completed",
 			NodeID:          nodeID,
 			NodeName:        node.Name,
 			Source:          "active",
+			Trigger:         qualityTriggerScheduled,
 			AuthID:          res.AuthID,
 			AuthEmail:       res.AuthEmail,
 			Classification:  res.Classification,
@@ -873,8 +896,9 @@ func scheduleSoftQualityProbe(store *stateStore, nodeID, nodeName string, trigge
 	}()
 }
 
-func applyObservation(store *stateStore, nodeID, source string, res qualityResult) {
+func applyObservation(store *stateStore, nodeID, source string, res qualityResult, triggerInfo ...string) {
 	pol := store.policy()
+	trigger := qualityEventTrigger(source, triggerInfo...)
 	if res.Classification == "error" && res.ErrorKind != "transport_error" {
 		res.Classification = "ignored"
 	}
@@ -990,6 +1014,7 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 			NodeID:         nodeCopy.ID,
 			NodeName:       nodeCopy.Name,
 			Source:         source,
+			Trigger:        trigger,
 			AuthID:         res.AuthID,
 			AuthEmail:      res.AuthEmail,
 			Classification: "healthy",
@@ -999,7 +1024,7 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		go func(nn nodeRecord) { _ = enableAuthsOnNode(&nn) }(nodeCopy)
 	}
 	if doQuarantine {
-		quarantineNode(store, nodeCopy.ID, quarantineWhy, res.TPS, res.Classification, res, source)
+		quarantineNode(store, nodeCopy.ID, quarantineWhy, res.TPS, res.Classification, res, source, trigger)
 	}
 	store.bumpStat(source, res.Classification, res.OutputTokens)
 	if doSoftProbe {
@@ -1011,6 +1036,10 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 	source := "active"
 	if len(sources) > 0 && strings.TrimSpace(sources[0]) != "" {
 		source = sources[0]
+	}
+	trigger := qualityEventTrigger(source)
+	if len(sources) > 1 {
+		trigger = qualityEventTrigger(source, sources[1])
 	}
 	pol := store.policy()
 	enabledHealthy := 0
@@ -1034,6 +1063,7 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 			NodeID:          target.ID,
 			NodeName:        target.Name,
 			Source:          source,
+			Trigger:         trigger,
 			AuthID:          res.AuthID,
 			AuthEmail:       res.AuthEmail,
 			Reason:          fmt.Sprintf("%s；隔离已抑制：低于最低健康节点数", reason),
@@ -1062,6 +1092,7 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 		NodeID:          updated.ID,
 		NodeName:        updated.Name,
 		Source:          source,
+		Trigger:         trigger,
 		AuthID:          res.AuthID,
 		AuthEmail:       res.AuthEmail,
 		Reason:          reason,
@@ -1073,19 +1104,19 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 	// Move accounts off the bad channel synchronously. The first phase disables
 	// them, so no new request can continue using the quarantined egress while
 	// migration and post-save verification are in flight.
-	if err := migrateAuthsOffNode(store, updated); err != nil {
-		store.appendEvent(guardEvent{Event: "accounts_migration_failed", NodeID: updated.ID, NodeName: updated.Name, Source: source, Reason: err.Error()})
+	if err := migrateAuthsOffNode(store, updated, trigger); err != nil {
+		store.appendEvent(guardEvent{Event: "accounts_migration_failed", NodeID: updated.ID, NodeName: updated.Name, Source: source, Trigger: trigger, Reason: err.Error()})
 		if pol.DisableAuthOnHard {
 			_ = disableAuthsOnNode(store, updated, "egress-guard 降智隔离: "+reason)
 		}
 	}
-	if rotated, err := rotateNodeIfConfigured(store, updated); err != nil {
-		store.appendEvent(guardEvent{Event: "node_rotation_failed", NodeID: updated.ID, NodeName: updated.Name, Source: source, Reason: err.Error()})
+	if rotated, err := rotateNodeIfConfigured(store, updated, trigger); err != nil {
+		store.appendEvent(guardEvent{Event: "node_rotation_failed", NodeID: updated.ID, NodeName: updated.Name, Source: source, Trigger: trigger, Reason: err.Error()})
 	} else if rotated {
 		// A newly rotated IP gets exactly one real-model confirmation before it
 		// can leave quarantine. A healthy result restores the node; anomalies keep
 		// it isolated for the normal recovery worker.
-		_, _ = runNodeQuality(store, updated.ID)
+		_, _ = runNodeQualityWithTrigger(store, updated.ID, qualityTriggerScheduled)
 	}
 }
 
@@ -1118,6 +1149,10 @@ func runNodeConnectivity(store *stateStore, id string) (map[string]any, error) {
 }
 
 func runNodeQuality(store *stateStore, id string) (map[string]any, error) {
+	return runNodeQualityWithTrigger(store, id, qualityTriggerScheduled)
+}
+
+func runNodeQualityWithTrigger(store *stateStore, id, trigger string) (map[string]any, error) {
 	n, ok := store.getNode(id)
 	if !ok {
 		return nil, fmt.Errorf("节点不存在")
@@ -1129,12 +1164,14 @@ func runNodeQuality(store *stateStore, id string) (map[string]any, error) {
 	if res.Classification == "error" && res.ErrorKind != "transport_error" {
 		res.Classification = "ignored"
 	}
-	applyObservation(store, id, "active", res)
+	trigger = qualityEventTrigger("active", trigger)
+	applyObservation(store, id, "active", res, trigger)
 	store.appendEvent(guardEvent{
 		Event:          "quality_probe_completed",
 		NodeID:         id,
 		NodeName:       n.Name,
 		Source:         "active",
+		Trigger:        trigger,
 		AuthID:         res.AuthID,
 		AuthEmail:      res.AuthEmail,
 		Classification: res.Classification,
@@ -1262,6 +1299,7 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 			store.appendEvent(guardEvent{
 				Event:          "unmapped_" + class,
 				Source:         "passive",
+				Trigger:        qualityTriggerAutomatic,
 				AuthID:         res.AuthID,
 				AuthEmail:      res.AuthEmail,
 				Classification: class,
@@ -1324,14 +1362,14 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 				now := float64(time.Now().Unix())
 				for _, n := range store.listNodes() {
 					if n.DisabledByGuard && n.QuarantinedUntil > 0 && now >= n.QuarantinedUntil {
-						_, _ = runNodeQuality(store, n.ID)
+						_, _ = runNodeQualityWithTrigger(store, n.ID, qualityTriggerScheduled)
 						continue
 					}
 					if pol.Mode == "active" || pol.Mode == "hybrid" {
 						// light active cadence per node via last probe
 						if n.Enabled && !n.DisabledByGuard && (n.LastProbeAt == 0 || now-n.LastProbeAt >= float64(pol.ActiveIntervalSec)) {
 							// don't stampede — one per tick
-							_, _ = runNodeQuality(store, n.ID)
+							_, _ = runNodeQualityWithTrigger(store, n.ID, qualityTriggerScheduled)
 							break
 						}
 					}

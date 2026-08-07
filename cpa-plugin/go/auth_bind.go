@@ -603,6 +603,22 @@ func normalAuthPool(auths []authFile) []authFile {
 	return pool
 }
 
+// listAuthFilesForProbe refreshes an empty/unusable cached snapshot once. CPA
+// can expose an empty pool briefly while auth files are loading; without the
+// fresh retry, a probe can report no account even after the pool is available.
+func listAuthFilesForProbe() ([]authFile, error) {
+	auths, err := listAuthFiles()
+	if err != nil {
+		return nil, err
+	}
+	if len(normalAuthPool(auths)) == 0 {
+		if fresh, freshErr := listAuthFilesFresh(); freshErr == nil {
+			auths = fresh
+		}
+	}
+	return auths, nil
+}
+
 // listAuthsForNode returns up to limit normal xAI auths bound to an enabled,
 // non-quarantined node. When no usable binding exists, it borrows from the
 // global normal pool in random order without changing proxy_url.
@@ -610,7 +626,7 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 	if limit <= 0 {
 		limit = 5
 	}
-	auths, err := listAuthFiles()
+	auths, err := listAuthFilesForProbe()
 	if err != nil {
 		return nil, err
 	}
@@ -646,7 +662,7 @@ func listAnyAuthsForIsolationRetest(limit int) ([]authFile, error) {
 	if limit <= 0 {
 		limit = 1
 	}
-	auths, err := listAuthFiles()
+	auths, err := listAuthFilesForProbe()
 	if err != nil {
 		return nil, err
 	}
@@ -714,7 +730,7 @@ func verifiedMigrationTargets(store *stateStore, bad *nodeRecord) []*nodeRecord 
 
 // migrateAuthsOffNode fails closed, then moves only guard-managed accounts to
 // recently active-verified nodes with a different observed exit IP.
-func migrateAuthsOffNode(store *stateStore, bad *nodeRecord) error {
+func migrateAuthsOffNode(store *stateStore, bad *nodeRecord, triggerInfo ...string) error {
 	if bad == nil || bad.ProxyURL == "" {
 		return nil
 	}
@@ -764,6 +780,7 @@ func migrateAuthsOffNode(store *stateStore, bad *nodeRecord) error {
 			NodeID:   bad.ID,
 			NodeName: bad.Name,
 			Source:   "active",
+			Trigger:  qualityEventTrigger("active", triggerInfo...),
 			Reason:   fmt.Sprintf("隔离后迁出 %d 个账号到健康通道，失败 %d 个", moved, failed),
 		})
 	}

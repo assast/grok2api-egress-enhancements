@@ -669,7 +669,7 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 
 	case len(parts) == 3 && parts[0] == "nodes" && safeID(parts[1]) && (parts[2] == "quality-test" || parts[2] == "quality"):
 		if method == http.MethodPost {
-			r, err := runNodeQuality(store, parts[1])
+			r, err := runNodeQualityWithTrigger(store, parts[1], qualityTriggerManual)
 			if err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("qualityFailed", err.Error()))
 			}
@@ -677,7 +677,7 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 		}
 	case len(parts) == 4 && parts[0] == "quality-guard" && parts[1] == "nodes" && safeID(parts[2]) && parts[3] == "test":
 		if method == http.MethodPost {
-			r, err := runNodeQuality(store, parts[2])
+			r, err := runNodeQualityWithTrigger(store, parts[2], qualityTriggerManual)
 			if err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("qualityFailed", err.Error()))
 			}

@@ -805,7 +805,7 @@ func TestStoreCreateNodesIsAllOrNothing(t *testing.T) {
 
 func TestRenderStatusPage(t *testing.T) {
 	page := strings.Replace(pageTemplate, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
-	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "批量添加", "/nodes/import", "/nodes/export", "页面每 15 秒刷新", "node-status-filter", "全部状态", "nodeStatusKey", "dedupe-exit-ip", "按出口 IP 剔重", "duplicateNodesByExitIP", "export-nodes", "egress-proxies.txt", "当前结果", "已绑定账号会随节点删除而解绑", "最短生成窗口", "policy-retry-keywords", "policy-prompt", "X-Grok2API-Egress-UI", "触发：", "原因：", "软阈值计数", "soft_strikes", "sourceName"} {
+	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "批量添加", "/nodes/import", "/nodes/export", "页面每 15 秒刷新", "node-status-filter", "全部状态", "nodeStatusKey", "dedupe-exit-ip", "按出口 IP 剔重", "duplicateNodesByExitIP", "export-nodes", "egress-proxies.txt", "当前结果", "已绑定账号会随节点删除而解绑", "最短生成窗口", "policy-retry-keywords", "policy-prompt", "X-Grok2API-Egress-UI", "触发：", "手动触发", "定时任务触发", "原因：", "软阈值计数", "soft_strikes", "sourceName", "triggerName"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("missing %q", want)
 		}
@@ -1126,6 +1126,94 @@ func TestAuthListCacheKeepsWarmPoolWhenHostReportsEmpty(t *testing.T) {
 	authListMu.Unlock()
 	if got, err := listAuthFilesFresh(); err != nil || len(got) != 0 {
 		t.Fatalf("persistent empty pool not adopted: n=%d err=%v", len(got), err)
+	}
+}
+
+func TestAuthSelectionRefreshesEmptyCacheAndBorrowsFromPool(t *testing.T) {
+	invalidateAuthListCache()
+	auths := map[string]map[string]any{}
+	original := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			entries := make([]pluginapi.HostAuthFileEntry, 0, len(auths))
+			for name := range auths {
+				entries = append(entries, pluginapi.HostAuthFileEntry{ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai"})
+			}
+			return json.Marshal(hostAuthListResponse{Files: entries})
+		case pluginabi.MethodHostAuthGet:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			raw, ok := auths[request["auth_index"]]
+			if !ok {
+				return nil, fmt.Errorf("missing auth %s", request["auth_index"])
+			}
+			body, _ := json.Marshal(raw)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: request["auth_index"], Name: request["auth_index"], JSON: body})
+		default:
+			return nil, fmt.Errorf("unexpected host callback %s", method)
+		}
+	}
+	defer func() {
+		hostCall = original
+		invalidateAuthListCache()
+	}()
+
+	// Reproduce the NC race: an empty host snapshot is cached before the pool
+	// finishes loading.
+	if got, err := listAuthFiles(); err != nil || len(got) != 0 {
+		t.Fatalf("initial empty pool: n=%d err=%v", len(got), err)
+	}
+	auths["pool-a.json"] = map[string]any{
+		"type": "xai", "email": "pool-a@example.test", "access_token": "token-a",
+		"proxy_url": "http://127.0.0.1:9001", "disabled": false,
+	}
+	auths["pool-b.json"] = map[string]any{
+		"type": "xai", "email": "pool-b@example.test", "access_token": "token-b",
+		"proxy_url": "http://127.0.0.1:9002", "disabled": false,
+	}
+
+	// The target has no bound account; selection must refresh the pool and
+	// borrow an account from another node instead of reporting no-account.
+	candidates, err := listAuthsForNode(&nodeRecord{
+		ID: "target", Name: "Node 027", ProxyURL: "http://127.0.0.1:9027", Enabled: true,
+	}, 1)
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("pool fallback: candidates=%d err=%v", len(candidates), err)
+	}
+	if candidates[0].Name != "pool-a.json" && candidates[0].Name != "pool-b.json" {
+		t.Fatalf("borrowed account=%q, want an account from the global pool", candidates[0].Name)
+	}
+}
+
+func TestQualityEventsRecordManualAndScheduledTrigger(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	store = s
+	node, err := s.createNode("Node 027", "http://127.0.0.1:9027", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.probeQualityFn = func(_ *stateStore, _ *nodeRecord) qualityResult {
+		return qualityResult{Classification: "healthy", Thinking: true, OutputTokens: 80, TPS: 80}
+	}
+
+	if _, err := dispatchAPI(http.MethodPost, "/nodes/"+node.ID+"/quality-test", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	events := s.events()
+	if len(events) == 0 || events[len(events)-1].Event != "quality_probe_completed" {
+		t.Fatalf("manual quality event missing: %+v", events)
+	}
+	if got := events[len(events)-1].Trigger; got != "manual" {
+		t.Fatalf("manual trigger=%q, want manual", got)
+	}
+
+	if _, err := runNodeQuality(s, node.ID); err != nil {
+		t.Fatal(err)
+	}
+	events = s.events()
+	if got := events[len(events)-1].Trigger; got != "scheduled" {
+		t.Fatalf("scheduled trigger=%q, want scheduled", got)
 	}
 }
 

@@ -342,7 +342,8 @@
     const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
     const number = (value) => new Intl.NumberFormat('zh-CN').format(Number(value || 0));
     const modeName = (mode) => ({active:'主动', passive:'被动', hybrid:'混合'})[mode] || '-';
-    const sourceName = (source) => ({active:'主动', passive:'被动'})[source] || '未记录';
+    const sourceName = (source) => ({active:'主动检测', passive:'被动审计'})[source] || '未记录';
+    const triggerName = (trigger) => ({manual:'手动触发', scheduled:'定时任务触发', automatic:'自动触发'})[trigger] || '未记录';
     const classificationName = (classification) => ({healthy:'健康', soft:'软阈值', hard:'硬阈值', error:'错误', ignored:'已忽略'})[classification] || classification || '';
     const time = (value, epoch = false) => {
       if (!value) return '-';
@@ -596,13 +597,16 @@
       $('events-list').innerHTML = events.slice().reverse().map((event) => {
         const auth = event.auth_email || event.auth_id || '';
         const source = event.source || ((event.event === 'soft_quality_probe_scheduled' || String(event.event || '').startsWith('unmapped_')) ? 'passive' : ['node_quarantined','node_restored','quality_probe_completed','soft_quality_probe_completed','node_rotated','node_rotation_failed','quarantine_suppressed','accounts_migrated','accounts_migration_failed'].includes(event.event) ? 'active' : '');
+        // Older persisted events never recorded the trigger; do not guess
+        // manual vs scheduled for those historical records.
+        const trigger = event.trigger || '';
         const sourceClass = source === 'passive' ? 'warn' : source === 'active' ? 'muted' : 'muted';
         const reason = String(event.reason || '').trim() || (event.event === 'node_restored' ? '质量检测通过' : event.classification ? '质量检测结果：' + classificationName(event.classification) : '-');
         const softStrikes = Number(event.soft_strikes || 0);
         const softLimit = Number(event.soft_strike_limit || state.status?.config?.consecutive_soft || 0);
         const softCounter = softStrikes > 0 ? '<span class="event-counter">软阈值计数 ' + number(softStrikes) + (softLimit > 0 ? '/' + number(softLimit) : '') + '</span>' : '';
         const title = esc(names[event.event] || event.event || '守护事件') + ' · ' + esc(event.node_name || (event.node_id ? ('节点 ' + event.node_id) : '未映射'));
-        const detail = '<span class="badge ' + sourceClass + '">触发：' + esc(sourceName(source)) + '</span><span class="event-reason">原因：' + esc(reason) + '</span>' + (event.classification ? '<span>结果：' + esc(classificationName(event.classification)) + '</span>' : '') + (softCounter ? '<span class="badge warn">' + softCounter + '</span>' : '') + (auth ? '<span>账号 ' + esc(auth) + '</span>' : '') + (event.output_tps ? '<span>' + Number(event.output_tps).toFixed(1) + ' Token/s</span>' : '');
+        const detail = '<span class="badge ' + sourceClass + '">触发：' + esc(triggerName(trigger)) + '</span>' + (source ? '<span>检测：' + esc(sourceName(source)) + '</span>' : '') + '<span class="event-reason">原因：' + esc(reason) + '</span>' + (event.classification ? '<span>结果：' + esc(classificationName(event.classification)) + '</span>' : '') + (softCounter ? '<span class="badge warn">' + softCounter + '</span>' : '') + (auth ? '<span>账号 ' + esc(auth) + '</span>' : '') + (event.output_tps ? '<span>' + Number(event.output_tps).toFixed(1) + ' Token/s</span>' : '');
         return '<div class="event"><div><strong>' + title + '</strong><small class="event-detail">' + detail + '</small></div><time>' + relative(event.ts) + '</time></div>';
       }).join('');
     }
