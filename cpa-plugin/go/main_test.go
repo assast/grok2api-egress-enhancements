@@ -287,6 +287,54 @@ func TestSoftObservationStartsOneBackgroundThinkingProbe(t *testing.T) {
 	t.Fatalf("background probe did not restore healthy state: %+v", current)
 }
 
+func TestQualityEventsExposeSourceReasonAndSoftStrikes(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := s.createNode("event-details", "http://127.0.0.1:7959", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.probeQualityFn = func(_ *stateStore, _ *nodeRecord) qualityResult {
+		return qualityResult{Classification: "healthy", Thinking: true, OutputTokens: 80, TPS: 80}
+	}
+	soft := qualityResult{Classification: "soft", OutputTokens: 80, TPS: 80, AuthID: "auth-1"}
+	applyObservation(s, node.ID, "passive", soft)
+	applyObservation(s, node.ID, "passive", soft)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		events := s.events()
+		if len(events) >= 2 {
+			var scheduled, completed *guardEvent
+			for i := range events {
+				event := &events[i]
+				switch event.Event {
+				case "soft_quality_probe_scheduled":
+					scheduled = event
+				case "soft_quality_probe_completed":
+					completed = event
+				}
+			}
+			if scheduled != nil && completed != nil {
+				if scheduled.Source != "passive" || scheduled.SoftStrikes != 2 || scheduled.SoftStrikeLimit != 2 {
+					t.Fatalf("scheduled event=%+v, want passive soft count 2/2", *scheduled)
+				}
+				if !strings.Contains(scheduled.Reason, "软阈值 2/2") {
+					t.Fatalf("scheduled reason=%q, want soft threshold count", scheduled.Reason)
+				}
+				if completed.Source != "active" || completed.SoftStrikes != 2 || completed.SoftStrikeLimit != 2 {
+					t.Fatalf("completed event=%+v, want active soft count 2/2", *completed)
+				}
+				if !strings.Contains(completed.Reason, "主动 thinking 复测通过") {
+					t.Fatalf("completed reason=%q, want active probe reason", completed.Reason)
+				}
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("missing soft probe events: %+v", s.events())
+}
+
 func TestPassiveHardSchedulesThinkingProbeWithoutQuarantine(t *testing.T) {
 	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	node, err := s.createNode("hard-passive", "http://127.0.0.1:7952", true, false, 0)
@@ -336,6 +384,64 @@ func TestActiveHardStillQuarantines(t *testing.T) {
 	current, _ := s.getNode(node.ID)
 	if !current.DisabledByGuard {
 		t.Fatal("active hard (missing thinking) must quarantine")
+	}
+	var quarantined *guardEvent
+	for _, event := range s.events() {
+		if event.Event == "node_quarantined" {
+			copy := event
+			quarantined = &copy
+		}
+	}
+	if quarantined == nil || quarantined.Source != "active" || quarantined.Reason != "质量探测响应未包含 thinking 块" {
+		t.Fatalf("quarantine event=%v, want active source and explicit reason", quarantined)
+	}
+}
+
+func TestQualityObservationTimeExcludesConnectivityProbe(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := s.createNode("timing", "http://127.0.0.1:7958", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observedAt := float64(time.Now().Add(-2 * time.Hour).Unix())
+	probeAt := float64(time.Now().Add(-time.Hour).Unix())
+	if _, err := s.updateNode(node.ID, func(value *nodeRecord) error {
+		value.LastObservedAt = observedAt
+		value.LastProbeAt = probeAt
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	originalConnectivity := probeConnectivityFn
+	probeConnectivityFn = func(string) (string, int64, error) {
+		return "198.51.100.8", 12, nil
+	}
+	defer func() { probeConnectivityFn = originalConnectivity }()
+
+	if _, err := runNodeConnectivity(s, node.ID); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := s.getNode(node.ID)
+	if current.LastObservedAt != observedAt {
+		t.Fatalf("connectivity changed last observed time from %v to %v", observedAt, current.LastObservedAt)
+	}
+	if current.LastProbeAt != probeAt {
+		t.Fatalf("connectivity changed last quality probe time from %v to %v", probeAt, current.LastProbeAt)
+	}
+
+	s.probeQualityFn = func(_ *stateStore, _ *nodeRecord) qualityResult {
+		return qualityResult{Classification: "healthy", Thinking: true, OutputTokens: 80, TPS: 80}
+	}
+	if _, err := runNodeQuality(s, node.ID); err != nil {
+		t.Fatal(err)
+	}
+	current, _ = s.getNode(node.ID)
+	if current.LastObservedAt <= observedAt {
+		t.Fatalf("quality did not advance last observed time: before=%v after=%v", observedAt, current.LastObservedAt)
+	}
+	if current.LastProbeAt <= probeAt {
+		t.Fatalf("quality did not advance last quality probe time: before=%v after=%v", probeAt, current.LastProbeAt)
 	}
 }
 
@@ -699,13 +805,16 @@ func TestStoreCreateNodesIsAllOrNothing(t *testing.T) {
 
 func TestRenderStatusPage(t *testing.T) {
 	page := strings.Replace(pageTemplate, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
-	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "批量添加", "/nodes/import", "/nodes/export", "页面每 15 秒刷新", "node-status-filter", "全部状态", "nodeStatusKey", "dedupe-exit-ip", "按出口 IP 剔重", "duplicateNodesByExitIP", "export-nodes", "egress-proxies.txt", "当前结果", "已绑定账号会随节点删除而解绑", "最短生成窗口", "policy-retry-keywords", "policy-prompt", "X-Grok2API-Egress-UI"} {
+	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "批量添加", "/nodes/import", "/nodes/export", "页面每 15 秒刷新", "node-status-filter", "全部状态", "nodeStatusKey", "dedupe-exit-ip", "按出口 IP 剔重", "duplicateNodesByExitIP", "export-nodes", "egress-proxies.txt", "当前结果", "已绑定账号会随节点删除而解绑", "最短生成窗口", "policy-retry-keywords", "policy-prompt", "X-Grok2API-Egress-UI", "触发：", "原因：", "软阈值计数", "soft_strikes", "sourceName"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("missing %q", want)
 		}
 	}
 	if strings.Contains(page, "/*__HALLMARK_TOKENS__*/") {
 		t.Fatal("tokens not replaced in test helper path only")
+	}
+	if strings.Contains(page, "guard.last_observed_at || guard.last_probe_at") {
+		t.Fatal("connectivity probe must not be used as the last observed time")
 	}
 }
 

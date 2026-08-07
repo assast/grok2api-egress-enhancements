@@ -763,6 +763,7 @@ func migrateAuthsOffNode(store *stateStore, bad *nodeRecord) error {
 			Event:    "accounts_migrated",
 			NodeID:   bad.ID,
 			NodeName: bad.Name,
+			Source:   "active",
 			Reason:   fmt.Sprintf("隔离后迁出 %d 个账号到健康通道，失败 %d 个", moved, failed),
 		})
 	}

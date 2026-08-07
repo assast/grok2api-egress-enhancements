@@ -71,15 +71,18 @@ type nodeCreateInput struct {
 }
 
 type guardEvent struct {
-	TS             float64 `json:"ts"`
-	Event          string  `json:"event"`
-	NodeID         string  `json:"node_id,omitempty"`
-	NodeName       string  `json:"node_name,omitempty"`
-	AuthID         string  `json:"auth_id,omitempty"`
-	AuthEmail      string  `json:"auth_email,omitempty"`
-	Reason         string  `json:"reason,omitempty"`
-	Classification string  `json:"classification,omitempty"`
-	OutputTPS      float64 `json:"output_tps,omitempty"`
+	TS              float64 `json:"ts"`
+	Event           string  `json:"event"`
+	NodeID          string  `json:"node_id,omitempty"`
+	NodeName        string  `json:"node_name,omitempty"`
+	Source          string  `json:"source,omitempty"`
+	AuthID          string  `json:"auth_id,omitempty"`
+	AuthEmail       string  `json:"auth_email,omitempty"`
+	Reason          string  `json:"reason,omitempty"`
+	Classification  string  `json:"classification,omitempty"`
+	OutputTPS       float64 `json:"output_tps,omitempty"`
+	SoftStrikes     int     `json:"soft_strikes,omitempty"`
+	SoftStrikeLimit int     `json:"soft_strike_limit,omitempty"`
 }
 
 type probeStats struct {

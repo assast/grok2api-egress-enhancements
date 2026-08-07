@@ -246,6 +246,8 @@ func probeConnectivity(proxyURL string) (exitIP string, latencyMs int64, err err
 	return ip, time.Since(start).Milliseconds(), nil
 }
 
+var probeConnectivityFn = probeConnectivity
+
 type qualityResult struct {
 	Classification string  `json:"classification"`
 	TPS            float64 `json:"tps"`
@@ -367,6 +369,43 @@ func quarantineReason(res qualityResult) string {
 	return fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
 }
 
+func softStrikeLimit(pol policyConfig) int {
+	if pol.ConsecutiveSoft <= 0 {
+		return 2
+	}
+	return pol.ConsecutiveSoft
+}
+
+func qualityObservationReason(source string, res qualityResult) string {
+	if reason := strings.TrimSpace(res.Error); reason != "" {
+		return reason
+	}
+	if source == "passive" {
+		return fmt.Sprintf("被动质量审计通过 · Token/s=%.1f", res.TPS)
+	}
+	if res.Thinking {
+		return "主动质量检测通过 · thinking 已确认"
+	}
+	return "主动质量检测完成"
+}
+
+func softProbeReason(softStrikes, softLimit int, res qualityResult) string {
+	prefix := "被动异常触发的主动 thinking 复测"
+	if softStrikes > 0 && softLimit > 0 {
+		prefix = fmt.Sprintf("被动软阈值 %d/%d 触发的主动 thinking 复测", softStrikes, softLimit)
+	}
+	if reason := strings.TrimSpace(res.Error); reason != "" {
+		return prefix + "失败：" + reason
+	}
+	if res.Classification == "healthy" && res.Thinking {
+		return prefix + "通过：thinking 已确认"
+	}
+	if res.Classification == "" {
+		return prefix
+	}
+	return prefix + "结果：" + res.Classification
+}
+
 func rotationAllowed(cfg pluginConfig, nodeID string) bool {
 	if strings.TrimSpace(cfg.RotationURL) == "" || strings.TrimSpace(nodeID) == "" {
 		return false
@@ -436,7 +475,7 @@ func rotateNodeIfConfigured(store *stateStore, node *nodeRecord) (bool, error) {
 	if err != nil || updated == nil {
 		return false, fmt.Errorf("保存换 IP 状态失败")
 	}
-	store.appendEvent(guardEvent{Event: "node_rotated", NodeID: node.ID, NodeName: node.Name, Reason: "Webhook 已确认出口 IP 变化"})
+	store.appendEvent(guardEvent{Event: "node_rotated", NodeID: node.ID, NodeName: node.Name, Source: "active", Reason: "Webhook 已确认出口 IP 变化"})
 	return true, nil
 }
 
@@ -785,17 +824,27 @@ func (s *stateStore) endSoftQualityProbe(nodeID string) {
 	s.probeMu.Unlock()
 }
 
-func scheduleSoftQualityProbe(store *stateStore, nodeID, nodeName string, trigger qualityResult) {
+func scheduleSoftQualityProbe(store *stateStore, nodeID, nodeName string, trigger qualityResult, strikeInfo ...int) {
 	if store == nil || !store.beginSoftQualityProbe(nodeID) {
 		return
 	}
+	softStrikes, softLimit := 0, 0
+	if len(strikeInfo) > 0 {
+		softStrikes = strikeInfo[0]
+	}
+	if len(strikeInfo) > 1 {
+		softLimit = strikeInfo[1]
+	}
 	store.appendEvent(guardEvent{
-		Event:     "soft_quality_probe_scheduled",
-		NodeID:    nodeID,
-		NodeName:  nodeName,
-		AuthID:    trigger.AuthID,
-		AuthEmail: trigger.AuthEmail,
-		Reason:    "被动阈值触发后台 thinking 质量确认",
+		Event:           "soft_quality_probe_scheduled",
+		NodeID:          nodeID,
+		NodeName:        nodeName,
+		Source:          "passive",
+		AuthID:          trigger.AuthID,
+		AuthEmail:       trigger.AuthEmail,
+		Reason:          softProbeReason(softStrikes, softLimit, qualityResult{}),
+		SoftStrikes:     softStrikes,
+		SoftStrikeLimit: softLimit,
 	})
 	go func() {
 		defer store.endSoftQualityProbe(nodeID)
@@ -809,14 +858,17 @@ func scheduleSoftQualityProbe(store *stateStore, nodeID, nodeName string, trigge
 		}
 		applyObservation(store, nodeID, "active", res)
 		store.appendEvent(guardEvent{
-			Event:          "soft_quality_probe_completed",
-			NodeID:         nodeID,
-			NodeName:       node.Name,
-			AuthID:         res.AuthID,
-			AuthEmail:      res.AuthEmail,
-			Classification: res.Classification,
-			OutputTPS:      res.TPS,
-			Reason:         res.Error,
+			Event:           "soft_quality_probe_completed",
+			NodeID:          nodeID,
+			NodeName:        node.Name,
+			Source:          "active",
+			AuthID:          res.AuthID,
+			AuthEmail:       res.AuthEmail,
+			Classification:  res.Classification,
+			OutputTPS:       res.TPS,
+			Reason:          softProbeReason(softStrikes, softLimit, res),
+			SoftStrikes:     softStrikes,
+			SoftStrikeLimit: softLimit,
 		})
 	}()
 }
@@ -827,6 +879,7 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		res.Classification = "ignored"
 	}
 	now := float64(time.Now().Unix())
+	softLimit := softStrikeLimit(pol)
 	var (
 		doRestore     bool
 		doQuarantine  bool
@@ -884,10 +937,7 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 				break
 			}
 			n.SoftStrikes++
-			need := pol.ConsecutiveSoft
-			if need <= 0 {
-				need = 2
-			}
+			need := softLimit
 			n.LastReason = fmt.Sprintf("软阈值 Token/s=%.1f · soft %d/%d", res.TPS, n.SoftStrikes, need)
 			if !n.DisabledByGuard && n.SoftStrikes >= need {
 				// Soft only arms after consecutive hits. One deduplicated
@@ -939,23 +989,29 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 			Event:          "node_restored",
 			NodeID:         nodeCopy.ID,
 			NodeName:       nodeCopy.Name,
+			Source:         source,
 			AuthID:         res.AuthID,
 			AuthEmail:      res.AuthEmail,
 			Classification: "healthy",
 			OutputTPS:      res.TPS,
+			Reason:         qualityObservationReason(source, res),
 		})
 		go func(nn nodeRecord) { _ = enableAuthsOnNode(&nn) }(nodeCopy)
 	}
 	if doQuarantine {
-		quarantineNode(store, nodeCopy.ID, quarantineWhy, res.TPS, res.Classification, res)
+		quarantineNode(store, nodeCopy.ID, quarantineWhy, res.TPS, res.Classification, res, source)
 	}
 	store.bumpStat(source, res.Classification, res.OutputTokens)
 	if doSoftProbe {
-		scheduleSoftQualityProbe(store, nodeCopy.ID, nodeCopy.Name, res)
+		scheduleSoftQualityProbe(store, nodeCopy.ID, nodeCopy.Name, res, nodeCopy.SoftStrikes, softLimit)
 	}
 }
 
-func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class string, res qualityResult) {
+func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class string, res qualityResult, sources ...string) {
+	source := "active"
+	if len(sources) > 0 && strings.TrimSpace(sources[0]) != "" {
+		source = sources[0]
+	}
 	pol := store.policy()
 	enabledHealthy := 0
 	var target *nodeRecord
@@ -974,13 +1030,16 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 	if enabledHealthy < pol.MinHealthyNodes {
 		store.bumpAction("suppressed")
 		store.appendEvent(guardEvent{
-			Event:     "quarantine_suppressed",
-			NodeID:    target.ID,
-			NodeName:  target.Name,
-			AuthID:    res.AuthID,
-			AuthEmail: res.AuthEmail,
-			Reason:    "低于最低健康节点数",
-			OutputTPS: tps,
+			Event:           "quarantine_suppressed",
+			NodeID:          target.ID,
+			NodeName:        target.Name,
+			Source:          source,
+			AuthID:          res.AuthID,
+			AuthEmail:       res.AuthEmail,
+			Reason:          fmt.Sprintf("%s；隔离已抑制：低于最低健康节点数", reason),
+			OutputTPS:       tps,
+			SoftStrikes:     target.SoftStrikes,
+			SoftStrikeLimit: softStrikeLimit(pol),
 		})
 		_, _ = store.updateNode(nodeID, func(n *nodeRecord) error {
 			n.LastReason = "隔离已抑制: " + reason
@@ -999,26 +1058,29 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 	}
 	store.bumpAction("quarantined")
 	store.appendEvent(guardEvent{
-		Event:          "node_quarantined",
-		NodeID:         updated.ID,
-		NodeName:       updated.Name,
-		AuthID:         res.AuthID,
-		AuthEmail:      res.AuthEmail,
-		Reason:         reason,
-		Classification: class,
-		OutputTPS:      tps,
+		Event:           "node_quarantined",
+		NodeID:          updated.ID,
+		NodeName:        updated.Name,
+		Source:          source,
+		AuthID:          res.AuthID,
+		AuthEmail:       res.AuthEmail,
+		Reason:          reason,
+		Classification:  class,
+		OutputTPS:       tps,
+		SoftStrikes:     updated.SoftStrikes,
+		SoftStrikeLimit: softStrikeLimit(pol),
 	})
 	// Move accounts off the bad channel synchronously. The first phase disables
 	// them, so no new request can continue using the quarantined egress while
 	// migration and post-save verification are in flight.
 	if err := migrateAuthsOffNode(store, updated); err != nil {
-		store.appendEvent(guardEvent{Event: "accounts_migration_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
+		store.appendEvent(guardEvent{Event: "accounts_migration_failed", NodeID: updated.ID, NodeName: updated.Name, Source: source, Reason: err.Error()})
 		if pol.DisableAuthOnHard {
 			_ = disableAuthsOnNode(store, updated, "egress-guard 降智隔离: "+reason)
 		}
 	}
 	if rotated, err := rotateNodeIfConfigured(store, updated); err != nil {
-		store.appendEvent(guardEvent{Event: "node_rotation_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
+		store.appendEvent(guardEvent{Event: "node_rotation_failed", NodeID: updated.ID, NodeName: updated.Name, Source: source, Reason: err.Error()})
 	} else if rotated {
 		// A newly rotated IP gets exactly one real-model confirmation before it
 		// can leave quarantine. A healthy result restores the node; anomalies keep
@@ -1032,7 +1094,7 @@ func runNodeConnectivity(store *stateStore, id string) (map[string]any, error) {
 	if !ok {
 		return nil, fmt.Errorf("节点不存在")
 	}
-	ip, ms, err := probeConnectivity(n.ProxyURL)
+	ip, ms, err := probeConnectivityFn(n.ProxyURL)
 	status := "ok"
 	if err != nil {
 		status = "error"
@@ -1040,7 +1102,6 @@ func runNodeConnectivity(store *stateStore, id string) (map[string]any, error) {
 	_, _ = store.updateNode(id, func(node *nodeRecord) error {
 		node.ProbeStatus = status
 		node.ProbeLatencyMs = ms
-		node.LastProbeAt = float64(time.Now().Unix())
 		if ip != "" {
 			node.ExitIP = ip
 		}
@@ -1073,11 +1134,12 @@ func runNodeQuality(store *stateStore, id string) (map[string]any, error) {
 		Event:          "quality_probe_completed",
 		NodeID:         id,
 		NodeName:       n.Name,
+		Source:         "active",
 		AuthID:         res.AuthID,
 		AuthEmail:      res.AuthEmail,
 		Classification: res.Classification,
 		OutputTPS:      res.TPS,
-		Reason:         res.Error,
+		Reason:         qualityObservationReason("active", res),
 	})
 	return map[string]any{
 		"id":             id,
@@ -1199,6 +1261,7 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 		if class == "hard" || class == "soft" {
 			store.appendEvent(guardEvent{
 				Event:          "unmapped_" + class,
+				Source:         "passive",
 				AuthID:         res.AuthID,
 				AuthEmail:      res.AuthEmail,
 				Classification: class,
