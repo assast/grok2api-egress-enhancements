@@ -111,14 +111,99 @@
     .stat small { display: block; margin-top: var(--space-3xs); color: var(--muted-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .lower-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(17rem, 2fr); gap: var(--space-md); }
     .events { max-height: 24rem; overflow: auto; }
-    .event { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-xs); padding: var(--space-2xs) var(--space-sm); border-bottom: var(--rule-hairline) solid var(--border); }
+    .event {
+      --event-accent: var(--muted-foreground);
+      display: grid;
+      grid-template-columns: 0.2rem minmax(0, 1fr) auto;
+      gap: var(--space-xs);
+      align-items: start;
+      padding: var(--space-xs) var(--space-sm);
+      border-bottom: var(--rule-hairline) solid var(--border);
+      transition: background var(--dur-fast) var(--ease-out);
+    }
     .event:last-child { border-bottom: 0; }
-    .event strong { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .event time, .event small { color: var(--muted-foreground); font-size: var(--text-2xs); white-space: nowrap; }
-    .event-detail { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-3xs) var(--space-xs); margin-top: 0; line-height: 1.35; white-space: normal !important; }
-    .event-detail .badge { min-height: 1.15rem; padding: 0 var(--space-3xs); }
-    .event-reason { min-width: 0; overflow-wrap: anywhere; }
+    .event:hover { background: color-mix(in oklch, var(--secondary) 55%, transparent); }
+    .event-kind-good { --event-accent: var(--success); }
+    .event-kind-warn { --event-accent: var(--warning); }
+    .event-kind-bad { --event-accent: var(--destructive); }
+    .event-rail {
+      width: 0.2rem;
+      min-height: 2.4rem;
+      margin-top: 0.15rem;
+      border-radius: 999px;
+      background: var(--event-accent);
+      opacity: 0.92;
+    }
+    .event-body { min-width: 0; display: grid; gap: 0.2rem; }
+    .event-primary {
+      display: flex;
+      align-items: baseline;
+      gap: var(--space-2xs);
+      min-width: 0;
+    }
+    .event-action {
+      flex: 0 1 auto;
+      margin: 0;
+      font-size: var(--text-xs);
+      font-weight: 650;
+      line-height: 1.35;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .event-node {
+      min-width: 0;
+      color: var(--muted-foreground);
+      font-size: var(--text-2xs);
+      font-weight: 550;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .event-node::before { content: "·"; margin-right: var(--space-2xs); color: color-mix(in oklch, var(--muted-foreground) 70%, transparent); }
+    .event-meta {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.2rem var(--space-2xs);
+      line-height: 1.35;
+    }
+    .event-meta .badge { min-height: 1.15rem; padding: 0 var(--space-3xs); }
+    .event-chip {
+      display: inline-flex;
+      align-items: center;
+      min-height: 1.15rem;
+      color: var(--muted-foreground);
+      font-size: var(--text-2xs);
+      white-space: nowrap;
+    }
+    .event-chip strong { color: var(--foreground); font-weight: 600; }
+    .event-reason {
+      margin: 0;
+      min-width: 0;
+      color: var(--muted-foreground);
+      font-size: var(--text-2xs);
+      line-height: 1.4;
+      overflow-wrap: anywhere;
+    }
+    .event-reason b { color: color-mix(in oklch, var(--foreground) 72%, var(--muted-foreground)); font-weight: 550; }
     .event-counter { font-variant-numeric: tabular-nums; }
+    .event time {
+      margin-top: 0.1rem;
+      color: var(--muted-foreground);
+      font-size: var(--text-2xs);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+      text-align: right;
+    }
+    .events .empty {
+      display: grid;
+      gap: var(--space-3xs);
+      justify-items: center;
+      padding: var(--space-lg) var(--space-sm);
+    }
+    .events .empty strong { color: var(--foreground); font-size: var(--text-xs); font-weight: 620; }
+    .events .empty span { max-width: 18rem; color: var(--muted-foreground); font-size: var(--text-2xs); line-height: 1.45; }
     .policy { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-sm); padding: var(--space-sm); }
     .policy dt { color: var(--muted-foreground); font-size: var(--text-2xs); }
     .policy dd { margin: var(--space-3xs) 0 0; font-weight: 620; font-variant-numeric: tabular-nums; }
@@ -253,8 +338,8 @@
 
     <div class="lower-grid">
       <section class="section" aria-labelledby="events-title">
-        <div class="section-head"><div><h2 id="events-title">最近事件</h2><p>隔离、恢复和质量检测结果 · 触发方式、原因与软阈值计数</p></div></div>
-        <div id="events-list" class="events"><div class="loading">正在加载事件</div></div>
+        <div class="section-head"><div><h2 id="events-title">最近事件</h2><p>按时间倒序 · 动作与节点优先，触发、原因与软阈值次之</p></div></div>
+        <div id="events-list" class="events" role="log" aria-live="polite" aria-relevant="additions"><div class="loading">正在加载事件</div></div>
       </section>
       <section class="section" aria-labelledby="policy-title">
         <div class="section-head"><div><h2 id="policy-title">守护策略</h2><p>修改后由 CPA 插件热加载</p></div><button id="edit-policy" class="button" type="button">编辑</button></div>
@@ -642,9 +727,20 @@
       $('statistics-since').textContent = stats.started_at ? '统计开始于 ' + time(stats.started_at, true) : '统计进程启动后的自动检测';
       $('statistics-grid').innerHTML = items.map((item) => '<div class="stat"><span class="metric-label">' + item[0] + '</span><strong>' + number(item[1]) + '</strong><small title="' + esc(item[2]) + '">' + esc(item[2]) + '</small></div>').join('');
     }
+    function eventKind(event) {
+      const name = String(event.event || '');
+      const cls = String(event.classification || '');
+      if (name === 'node_restored' || (name === 'quality_probe_completed' && cls === 'healthy')) return 'good';
+      if (['node_quarantined','node_rotation_failed','accounts_migration_failed'].includes(name) || cls === 'hard' || cls === 'error') return 'bad';
+      if (name.startsWith('soft_') || name === 'quarantine_suppressed' || cls === 'soft') return 'warn';
+      return 'muted';
+    }
     function renderEvents() {
       const events = state.status?.recentEvents || [];
-      if (!events.length) { $('events-list').innerHTML = '<div class="empty">暂无守护事件</div>'; return; }
+      if (!events.length) {
+        $('events-list').innerHTML = '<div class="empty"><strong>暂无守护事件</strong><span>隔离、恢复、质量检测与软阈值复测结果会按时间倒序出现在这里</span></div>';
+        return;
+      }
       const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',soft_quality_probe_scheduled:'已安排 thinking 复测',soft_quality_probe_completed:'thinking 复测完成',soft_quality_probe_skipped:'thinking 复测已跳过',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败'};
       $('events-list').innerHTML = events.slice().reverse().map((event) => {
         const auth = event.auth_email || event.auth_id || '';
@@ -652,14 +748,31 @@
         // Older persisted events never recorded the trigger; do not guess
         // manual vs scheduled for those historical records.
         const trigger = event.trigger || '';
-        const sourceClass = source === 'passive' ? 'warn' : source === 'active' ? 'muted' : 'muted';
+        const triggerClass = trigger === 'manual' ? 'good' : trigger === 'automatic' ? 'warn' : 'muted';
         const reason = String(event.reason || '').trim() || (event.event === 'node_restored' ? '质量检测通过' : event.classification ? '质量检测结果：' + classificationName(event.classification) : '-');
         const softStrikes = Number(event.soft_strikes || 0);
         const softLimit = Number(event.soft_strike_limit || state.status?.config?.consecutive_soft || 0);
-        const softCounter = softStrikes > 0 ? '<span class="event-counter">软阈值计数 ' + number(softStrikes) + (softLimit > 0 ? '/' + number(softLimit) : '') + '</span>' : '';
-        const title = esc(names[event.event] || event.event || '守护事件') + ' · ' + esc(event.node_name || (event.node_id ? ('节点 ' + event.node_id) : '未映射'));
-        const detail = '<span class="badge ' + sourceClass + '">触发：' + esc(triggerName(trigger)) + '</span>' + (source ? '<span>检测：' + esc(sourceName(source)) + '</span>' : '') + '<span class="event-reason">原因：' + esc(reason) + '</span>' + (event.classification ? '<span>结果：' + esc(classificationName(event.classification)) + '</span>' : '') + (softCounter ? '<span class="badge warn">' + softCounter + '</span>' : '') + (auth ? '<span>账号 ' + esc(auth) + '</span>' : '') + (event.output_tps ? '<span>' + Number(event.output_tps).toFixed(1) + ' Token/s</span>' : '');
-        return '<div class="event"><div><strong>' + title + '</strong><small class="event-detail">' + detail + '</small></div><time>' + relative(event.ts) + '</time></div>';
+        const softCounter = softStrikes > 0 ? '<span class="badge warn"><span class="event-counter">软阈值计数 ' + number(softStrikes) + (softLimit > 0 ? '/' + number(softLimit) : '') + '</span></span>' : '';
+        const action = names[event.event] || event.event || '守护事件';
+        const nodeLabel = event.node_name || (event.node_id ? ('节点 ' + event.node_id) : '未映射');
+        const kind = eventKind(event);
+        const meta = [
+          '<span class="badge ' + triggerClass + '">触发：' + esc(triggerName(trigger)) + '</span>',
+          source ? '<span class="event-chip">检测 <strong>' + esc(sourceName(source)) + '</strong></span>' : '',
+          event.classification ? '<span class="event-chip">结果 <strong>' + esc(classificationName(event.classification)) + '</strong></span>' : '',
+          softCounter,
+          auth ? '<span class="event-chip">账号 <strong>' + esc(auth) + '</strong></span>' : '',
+          event.output_tps ? '<span class="event-chip"><strong>' + Number(event.output_tps).toFixed(1) + '</strong> Token/s</span>' : ''
+        ].filter(Boolean).join('');
+        return '<article class="event event-kind-' + kind + '">' +
+          '<span class="event-rail" aria-hidden="true"></span>' +
+          '<div class="event-body">' +
+            '<div class="event-primary"><strong class="event-action">' + esc(action) + '</strong><span class="event-node" title="' + esc(nodeLabel) + '">' + esc(nodeLabel) + '</span></div>' +
+            '<div class="event-meta">' + meta + '</div>' +
+            '<p class="event-reason"><b>原因：</b>' + esc(reason) + '</p>' +
+          '</div>' +
+          '<time datetime="' + esc(event.ts ? new Date(Number(event.ts) * 1000).toISOString() : '') + '" title="' + esc(time(event.ts, true)) + '">' + relative(event.ts) + '</time>' +
+        '</article>';
       }).join('');
     }
     function renderPolicy() {
