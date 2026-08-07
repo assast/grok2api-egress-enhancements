@@ -81,6 +81,7 @@
 | 批量导入 | 单行代理 URL，或 `名称 | 代理 URL | 容量 | fixed/pool`；最多 500 条、整批原子写入 |
 | 连通性测试 | 经该出口探测外网出口 IP / 延迟 |
 | 质量测试 | 真实 chat 探测，计算 output Token/s |
+| 全量主动检测 | 手动排队所有已启用节点，按审计轮询间隔依次执行质量探测 |
 | 绑定账号 | 查看粘在该节点 `proxy_url` 上的账号列表 |
 | 批量启停 / 删除 | 删除前自动解绑 proxy |
 
@@ -321,6 +322,7 @@ Content-Type: application/json
 | `/nodes/{id}` | GET/PUT/DELETE | 单节点 |
 | `/nodes/{id}/test` | POST | 连通测试 |
 | `/nodes/{id}/quality-test` | POST | 质量探测 |
+| `/quality-guard/full-test` | POST | 手动排队全量主动质量探测；按 `passive_poll_seconds` 依次执行 |
 | `/nodes/{id}/accounts` | GET | 绑定账号列表 |
 
 （另保留若干 `/quality-guard/*` 别名路径，便于从旧 UI 习惯迁移。）

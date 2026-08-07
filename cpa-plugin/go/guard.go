@@ -856,6 +856,7 @@ func scheduleSoftQualityProbe(store *stateStore, nodeID, nodeName string, trigge
 	if len(strikeInfo) > 1 {
 		softLimit = strikeInfo[1]
 	}
+	baseReason := softProbeReason(softStrikes, softLimit, qualityResult{})
 	store.appendEvent(guardEvent{
 		Event:           "soft_quality_probe_scheduled",
 		NodeID:          nodeID,
@@ -864,14 +865,34 @@ func scheduleSoftQualityProbe(store *stateStore, nodeID, nodeName string, trigge
 		Trigger:         qualityTriggerScheduled,
 		AuthID:          trigger.AuthID,
 		AuthEmail:       trigger.AuthEmail,
-		Reason:          softProbeReason(softStrikes, softLimit, qualityResult{}),
+		Reason:          baseReason,
 		SoftStrikes:     softStrikes,
 		SoftStrikeLimit: softLimit,
 	})
 	go func() {
 		defer store.endSoftQualityProbe(nodeID)
+		appendSkipped := func(reason string) {
+			store.appendEvent(guardEvent{
+				Event:           "soft_quality_probe_skipped",
+				NodeID:          nodeID,
+				NodeName:        nodeName,
+				Source:          "active",
+				Trigger:         qualityTriggerScheduled,
+				Classification:  "ignored",
+				Reason:          baseReason + "未执行：" + reason,
+				SoftStrikes:     softStrikes,
+				SoftStrikeLimit: softLimit,
+			})
+		}
 		node, ok := store.getNode(nodeID)
-		if !ok || !node.Enabled || node.DisabledByGuard {
+		// A guard-quarantined node still needs this confirmation: the probe can
+		// borrow a normal account and is the path that may restore the node.
+		if !ok {
+			appendSkipped("节点已不存在")
+			return
+		}
+		if !node.Enabled {
+			appendSkipped("节点已人工停用")
 			return
 		}
 		res := normalizeQualityProbeResult(store.runQualityProbe(node))
@@ -963,7 +984,7 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 			n.SoftStrikes++
 			need := softLimit
 			n.LastReason = fmt.Sprintf("软阈值 Token/s=%.1f · soft %d/%d", res.TPS, n.SoftStrikes, need)
-			if !n.DisabledByGuard && n.SoftStrikes >= need {
+			if n.Enabled && !n.DisabledByGuard && n.SoftStrikes >= need {
 				// Soft only arms after consecutive hits. One deduplicated
 				// background model probe then confirms thinking before isolating.
 				doSoftProbe = true
@@ -975,7 +996,7 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 			if source == "passive" {
 				// Passive hard TPS only schedules a thinking re-probe; never
 				// quarantines on the usage signal alone.
-				if !n.DisabledByGuard {
+				if n.Enabled && !n.DisabledByGuard {
 					doSoftProbe = true
 					n.LastReason = fmt.Sprintf("硬阈值 Token/s=%.1f · thinking 复测", res.TPS)
 				} else {
@@ -1356,33 +1377,61 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 				}
 				_ = store.Flush()
 				return
+			case <-store.workerWake:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				runGuardWorkerTick(store, &tick)
+				timer.Reset(workerPollInterval(store))
 			case <-timer.C:
-				tick++
-				pol := store.policy()
-				now := float64(time.Now().Unix())
-				for _, n := range store.listNodes() {
-					if n.DisabledByGuard && n.QuarantinedUntil > 0 && now >= n.QuarantinedUntil {
-						_, _ = runNodeQualityWithTrigger(store, n.ID, qualityTriggerScheduled)
-						continue
-					}
-					if pol.Mode == "active" || pol.Mode == "hybrid" {
-						// light active cadence per node via last probe
-						if n.Enabled && !n.DisabledByGuard && (n.LastProbeAt == 0 || now-n.LastProbeAt >= float64(pol.ActiveIntervalSec)) {
-							// don't stampede — one per tick
-							_, _ = runNodeQualityWithTrigger(store, n.ID, qualityTriggerScheduled)
-							break
-						}
-					}
-				}
-				// Assigned counts are maintained on rebalance/migrate; a slow
-				// background reconcile is enough for drift from external edits.
-				if tick%10 == 0 {
-					refreshAssignedCounts(store)
-				}
+				runGuardWorkerTick(store, &tick)
 				timer.Reset(workerPollInterval(store))
 			}
 		}
 	}()
+}
+
+func runGuardWorkerTick(store *stateStore, tick *int) {
+	if store == nil {
+		return
+	}
+	if tick != nil {
+		*tick = *tick + 1
+	}
+	if id, ok := store.takeManualActiveNode(); ok {
+		if node, exists := store.getNode(id); exists && node.Enabled {
+			_, _ = runNodeQualityWithTrigger(store, id, qualityTriggerManual)
+		}
+		store.completeManualActiveNode()
+		if tick != nil && *tick%10 == 0 {
+			refreshAssignedCounts(store)
+		}
+		return
+	}
+	pol := store.policy()
+	now := float64(time.Now().Unix())
+	for _, n := range store.listNodes() {
+		if n.DisabledByGuard && n.QuarantinedUntil > 0 && now >= n.QuarantinedUntil {
+			_, _ = runNodeQualityWithTrigger(store, n.ID, qualityTriggerScheduled)
+			continue
+		}
+		if pol.Mode == "active" || pol.Mode == "hybrid" {
+			// light active cadence per node via last probe
+			if n.Enabled && !n.DisabledByGuard && (n.LastProbeAt == 0 || now-n.LastProbeAt >= float64(pol.ActiveIntervalSec)) {
+				// don't stampede — one per tick
+				_, _ = runNodeQualityWithTrigger(store, n.ID, qualityTriggerScheduled)
+				break
+			}
+		}
+	}
+	// Assigned counts are maintained on rebalance/migrate; a slow
+	// background reconcile is enough for drift from external edits.
+	if tick != nil && *tick%10 == 0 {
+		refreshAssignedCounts(store)
+	}
 }
 
 func workerPollInterval(store *stateStore) time.Duration {

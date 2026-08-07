@@ -109,6 +109,23 @@ type statistics struct {
 	Actions   actionStats `json:"actions"`
 }
 
+type activeCycleStatus struct {
+	Running     bool    `json:"running"`
+	Total       int     `json:"total"`
+	Completed   int     `json:"completed"`
+	StartedAt   float64 `json:"started_at,omitempty"`
+	IntervalSec int     `json:"interval_seconds"`
+}
+
+type activeCycleRuntime struct {
+	mu        sync.Mutex
+	ids       []string
+	total     int
+	completed int
+	running   bool
+	startedAt float64
+}
+
 type guardState struct {
 	Version   int                    `json:"version"`
 	Policy    policyConfig           `json:"policy"`
@@ -132,6 +149,8 @@ type stateStore struct {
 	probeMu          sync.Mutex
 	softProbeRunning map[string]struct{}
 	probeQualityFn   func(*stateStore, *nodeRecord) qualityResult
+	workerWake       chan struct{}
+	activeCycle      activeCycleRuntime
 }
 
 func defaultPolicy() policyConfig {
@@ -181,7 +200,7 @@ func normalizeProbeRetryKeywords(values []string) []string {
 }
 
 func newStateStore(path string) *stateStore {
-	s := &stateStore{path: path, flushDelay: 2 * time.Second}
+	s := &stateStore{path: path, flushDelay: 2 * time.Second, workerWake: make(chan struct{}, 1)}
 	s.data = guardState{
 		Version: 1,
 		Policy:  defaultPolicy(),
@@ -192,6 +211,104 @@ func newStateStore(path string) *stateStore {
 	}
 	_ = s.load()
 	return s
+}
+
+func (s *stateStore) wakeWorker() {
+	if s == nil || s.workerWake == nil {
+		return
+	}
+	select {
+	case s.workerWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *stateStore) startManualActiveCycle() (activeCycleStatus, bool) {
+	if s == nil {
+		return activeCycleStatus{}, false
+	}
+	nodes := s.listNodes()
+	ids := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		if n.Enabled && strings.TrimSpace(n.ProxyURL) != "" {
+			ids = append(ids, n.ID)
+		}
+	}
+
+	s.activeCycle.mu.Lock()
+	if s.activeCycle.running {
+		status := s.activeCycleStatusLocked()
+		s.activeCycle.mu.Unlock()
+		status.IntervalSec = int(workerPollInterval(s) / time.Second)
+		return status, false
+	}
+	if len(ids) == 0 {
+		s.activeCycle.mu.Unlock()
+		return activeCycleStatus{}, false
+	}
+	s.activeCycle.ids = ids
+	s.activeCycle.total = len(ids)
+	s.activeCycle.completed = 0
+	s.activeCycle.startedAt = float64(time.Now().Unix())
+	s.activeCycle.running = true
+	status := s.activeCycleStatusLocked()
+	s.activeCycle.mu.Unlock()
+	status.IntervalSec = int(workerPollInterval(s) / time.Second)
+	s.wakeWorker()
+	return status, true
+}
+
+func (s *stateStore) takeManualActiveNode() (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	s.activeCycle.mu.Lock()
+	defer s.activeCycle.mu.Unlock()
+	if !s.activeCycle.running || len(s.activeCycle.ids) == 0 {
+		return "", false
+	}
+	id := s.activeCycle.ids[0]
+	s.activeCycle.ids = s.activeCycle.ids[1:]
+	return id, true
+}
+
+func (s *stateStore) completeManualActiveNode() {
+	if s == nil {
+		return
+	}
+	s.activeCycle.mu.Lock()
+	defer s.activeCycle.mu.Unlock()
+	s.activeCycle.completed++
+	if s.activeCycle.completed >= s.activeCycle.total {
+		s.activeCycle.running = false
+		s.activeCycle.ids = nil
+	}
+}
+
+func (s *stateStore) activeCycleStatusLocked() activeCycleStatus {
+	status := activeCycleStatus{
+		Running:     s.activeCycle.running,
+		Total:       s.activeCycle.total,
+		Completed:   s.activeCycle.completed,
+		StartedAt:   s.activeCycle.startedAt,
+		IntervalSec: 5,
+	}
+	if status.Total > 0 && status.Completed > status.Total {
+		status.Completed = status.Total
+	}
+	return status
+}
+
+func (s *stateStore) activeCycleStatus() activeCycleStatus {
+	if s == nil {
+		return activeCycleStatus{}
+	}
+	s.activeCycle.mu.Lock()
+	status := s.activeCycleStatusLocked()
+	s.activeCycle.mu.Unlock()
+	interval := workerPollInterval(s)
+	status.IntervalSec = int(interval / time.Second)
+	return status
 }
 
 func (s *stateStore) load() error {

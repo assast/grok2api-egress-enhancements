@@ -111,11 +111,12 @@
     .stat small { display: block; margin-top: var(--space-3xs); color: var(--muted-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .lower-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(17rem, 2fr); gap: var(--space-md); }
     .events { max-height: 24rem; overflow: auto; }
-    .event { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-sm); padding: var(--space-xs) var(--space-sm); border-bottom: var(--rule-hairline) solid var(--border); }
+    .event { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-xs); padding: var(--space-2xs) var(--space-sm); border-bottom: var(--rule-hairline) solid var(--border); }
     .event:last-child { border-bottom: 0; }
     .event strong { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .event time, .event small { color: var(--muted-foreground); font-size: var(--text-2xs); white-space: nowrap; }
-    .event-detail { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2xs); margin-top: var(--space-3xs); white-space: normal !important; }
+    .event-detail { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-3xs) var(--space-xs); margin-top: 0; line-height: 1.35; white-space: normal !important; }
+    .event-detail .badge { min-height: 1.15rem; padding: 0 var(--space-3xs); }
     .event-reason { min-width: 0; overflow-wrap: anywhere; }
     .event-counter { font-variant-numeric: tabular-nums; }
     .policy { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-sm); padding: var(--space-sm); }
@@ -219,6 +220,7 @@
           <button id="export-nodes" class="button" type="button" title="导出当前筛选结果中的代理链接" disabled>导出节点</button>
           <span id="node-result-summary" class="filter-summary" aria-live="polite">当前结果 0 个</span>
           <button id="rebalance-nodes" class="button" type="button" title="按启用节点把 CPA 账号 proxy_url 重新均分">重平衡账号</button>
+          <button id="full-active-test" class="button primary" type="button" title="按审计轮询间隔依次检测所有已启用节点">全量主动检测</button>
           <button id="bulk-add-node" class="button" type="button">批量添加</button>
           <button id="add-node" class="button primary" type="button">添加节点</button>
         </div>
@@ -337,7 +339,8 @@
     'use strict';
     const PLUGIN_BASE = '/v0/resource/plugins/grok2api-egress';
     const MANAGEMENT_API = '/v0/management/grok2api-egress/api';
-    const state = { status: null, nodes: [], selected: new Set(), search: '', statusFilter: '', editing: null, confirm: null, loading: false, autoTimer: 0 };
+    const state = { status: null, nodes: [], selected: new Set(), search: '', statusFilter: '', editing: null, confirm: null, loading: false, autoTimer: 0, cycleTimer: 0, cyclePolling: false };
+    const defaultNodesFreshness = '页面每 15 秒刷新；节点健康状态随请求审计或主动检测更新，代理凭据不会回显';
     const $ = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
     const number = (value) => new Intl.NumberFormat('zh-CN').format(Number(value || 0));
@@ -427,6 +430,7 @@
         state.nodes = Array.isArray(items) ? items : [];
         state.selected = new Set([...state.selected].filter((id) => state.nodes.some((node) => node.id === id)));
         render();
+        if (status?.active_cycle?.running) monitorActiveCycle(); else stopCycleMonitor();
         setService(true, status?.engine === 'cpa-native' ? 'CPA 原生守护' : '已连接');
       } catch (error) {
         setService(false, '连接失败');
@@ -438,7 +442,55 @@
       }
     }
     function render() {
-      renderMetrics(); renderNodes(); renderStatistics(); renderEvents(); renderPolicy();
+      renderMetrics(); renderNodes(); renderActiveCycle(); renderStatistics(); renderEvents(); renderPolicy();
+    }
+    function renderActiveCycle() {
+      const button = $('full-active-test');
+      const cycle = state.status?.active_cycle || {};
+      if (!button) return;
+      if (cycle.running) {
+        const completed = Number(cycle.completed || 0);
+        const total = Number(cycle.total || 0);
+        const interval = Number(cycle.interval_seconds || state.status?.config?.passive_poll_seconds || 0);
+        button.textContent = '检测中 ' + completed + '/' + total;
+        button.title = '全量主动检测进行中；每 ' + interval + ' 秒检测一个节点';
+        $('nodes-freshness').textContent = '全量主动检测进行中：已完成 ' + completed + '/' + total + ' 个节点；每 ' + interval + ' 秒检测一个节点';
+      } else {
+        button.textContent = '全量主动检测';
+        button.title = '按审计轮询间隔依次检测所有已启用节点';
+        $('nodes-freshness').textContent = defaultNodesFreshness;
+      }
+      button.disabled = Boolean(cycle.running);
+    }
+    function stopCycleMonitor() {
+      if (!state.cycleTimer) return;
+      window.clearInterval(state.cycleTimer);
+      state.cycleTimer = 0;
+    }
+    async function pollActiveCycle() {
+      if (state.cyclePolling) return;
+      state.cyclePolling = true;
+      try {
+        const previousRunning = Boolean(state.status?.active_cycle?.running);
+        const status = await api('/quality-guard');
+        state.status = status;
+        render();
+        if (!status?.active_cycle?.running) {
+          stopCycleMonitor();
+          if (previousRunning) {
+            toast('全量主动检测已完成');
+            await load(true);
+          }
+        }
+      } catch (_) {
+        // The normal page refresh will surface connection errors; keep the
+        // short progress poll alive so a transient error cannot orphan it.
+      } finally {
+        state.cyclePolling = false;
+      }
+    }
+    function monitorActiveCycle() {
+      if (!state.cycleTimer) state.cycleTimer = window.setInterval(() => { void pollActiveCycle(); }, 1000);
     }
     function renderMetrics() {
       const status = state.status || {};
@@ -593,10 +645,10 @@
     function renderEvents() {
       const events = state.status?.recentEvents || [];
       if (!events.length) { $('events-list').innerHTML = '<div class="empty">暂无守护事件</div>'; return; }
-      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',soft_quality_probe_scheduled:'已安排 thinking 复测',soft_quality_probe_completed:'thinking 复测完成',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败'};
+      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',soft_quality_probe_scheduled:'已安排 thinking 复测',soft_quality_probe_completed:'thinking 复测完成',soft_quality_probe_skipped:'thinking 复测已跳过',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败'};
       $('events-list').innerHTML = events.slice().reverse().map((event) => {
         const auth = event.auth_email || event.auth_id || '';
-        const source = event.source || ((event.event === 'soft_quality_probe_scheduled' || String(event.event || '').startsWith('unmapped_')) ? 'passive' : ['node_quarantined','node_restored','quality_probe_completed','soft_quality_probe_completed','node_rotated','node_rotation_failed','quarantine_suppressed','accounts_migrated','accounts_migration_failed'].includes(event.event) ? 'active' : '');
+        const source = event.source || ((event.event === 'soft_quality_probe_scheduled' || String(event.event || '').startsWith('unmapped_')) ? 'passive' : ['node_quarantined','node_restored','quality_probe_completed','soft_quality_probe_completed','soft_quality_probe_skipped','node_rotated','node_rotation_failed','quarantine_suppressed','accounts_migrated','accounts_migration_failed'].includes(event.event) ? 'active' : '');
         // Older persisted events never recorded the trigger; do not guess
         // manual vs scheduled for those historical records.
         const trigger = event.trigger || '';
@@ -765,6 +817,30 @@
       } catch (error) { toast(error.message, 'error'); }
       finally { busy(button, false); }
     }
+    async function fullActiveTest(button) {
+      if (state.status?.active_cycle?.running) {
+        toast('全量主动检测正在进行中');
+        monitorActiveCycle();
+        return;
+      }
+      busy(button, true);
+      try {
+        const result = await api('/quality-guard/full-test', {method:'POST'});
+        const cycle = result.data || result;
+        state.status = {...state.status, active_cycle: cycle};
+        render();
+        if (cycle.started) {
+          toast('已开始全量主动检测：' + number(cycle.total) + ' 个节点，每 ' + number(cycle.interval_seconds) + ' 秒一个');
+          monitorActiveCycle();
+        } else if (cycle.running) {
+          toast('全量主动检测正在进行中');
+          monitorActiveCycle();
+        } else {
+          toast(cycle.message || '没有可检测的启用节点', 'error');
+        }
+      } catch (error) { toast(error.message, 'error'); }
+      finally { busy(button, false); renderActiveCycle(); }
+    }
     $('refresh-button').addEventListener('click', () => load());
     $('theme-button').addEventListener('click', () => {
       const dark = document.documentElement.dataset.theme === 'dark';
@@ -796,6 +872,7 @@
       } catch (error) { toast(error.message, 'error'); }
       finally { busy(button, false); }
     });
+    $('full-active-test').addEventListener('click', (event) => { void fullActiveTest(event.currentTarget); });
     $('edit-policy').addEventListener('click', openPolicy);
     $('select-all').addEventListener('change', (event) => {
       filteredNodes().forEach((node) => event.target.checked ? state.selected.add(node.id) : state.selected.delete(node.id)); renderNodes();

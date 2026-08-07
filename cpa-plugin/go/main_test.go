@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -364,6 +365,51 @@ func TestPassiveHardSchedulesThinkingProbeWithoutQuarantine(t *testing.T) {
 	}
 }
 
+func TestScheduledThinkingProbeRunsForGuardQuarantinedNode(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := s.createNode("guard-quarantined", "http://127.0.0.1:7956", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.updateNode(node.ID, func(value *nodeRecord) error {
+		value.DisabledByGuard = true
+		value.QuarantinedUntil = float64(time.Now().Add(time.Minute).Unix())
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	called := make(chan struct{}, 1)
+	s.probeQualityFn = func(_ *stateStore, value *nodeRecord) qualityResult {
+		if !value.DisabledByGuard {
+			t.Error("scheduled probe lost the guard-quarantined state")
+		}
+		called <- struct{}{}
+		return qualityResult{
+			Classification: "error",
+			ErrorKind:      "no_account",
+			Error:          "没有可用的 CPA xAI 账号",
+		}
+	}
+
+	scheduleSoftQualityProbe(s, node.ID, node.Name, qualityResult{}, 2, 2)
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("scheduled thinking probe was silently skipped for a guard-quarantined node")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		for _, event := range s.events() {
+			if event.Event == "soft_quality_probe_completed" && event.NodeID == node.ID {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("scheduled thinking probe result missing: %+v", s.events())
+}
+
 func TestActiveHardStillQuarantines(t *testing.T) {
 	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	node, err := s.createNode("hard-active", "http://127.0.0.1:7954", true, false, 0)
@@ -454,6 +500,71 @@ func TestWorkerPollIntervalUsesPassivePollSeconds(t *testing.T) {
 	}
 	if got := workerPollInterval(s); got != 7*time.Second {
 		t.Fatalf("workerPollInterval=%v, want 7s", got)
+	}
+}
+
+func TestManualActiveCycleUsesAuditPollIntervalSequentially(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	pol := s.policy()
+	pol.PassivePollSec = 1
+	if err := s.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := s.createNode(fmt.Sprintf("cycle-%d", i), fmt.Sprintf("http://127.0.0.1:%d", 7960+i), true, false, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	type probeCall struct {
+		id string
+		at time.Time
+	}
+	calls := make(chan probeCall, 3)
+	s.probeQualityFn = func(_ *stateStore, node *nodeRecord) qualityResult {
+		calls <- probeCall{id: node.ID, at: time.Now()}
+		return qualityResult{Classification: "healthy", Thinking: true, OutputTokens: 80, TPS: 80}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startGuardWorker(ctx, s)
+	status, started := s.startManualActiveCycle()
+	if !started || status.Total != 3 || status.IntervalSec != 1 {
+		t.Fatalf("cycle start status=%+v, started=%v", status, started)
+	}
+
+	observed := make([]probeCall, 0, 3)
+	for len(observed) < 3 {
+		select {
+		case call := <-calls:
+			observed = append(observed, call)
+		case <-time.After(4 * time.Second):
+			t.Fatalf("manual active cycle did not finish: calls=%+v status=%+v", observed, s.activeCycleStatus())
+		}
+	}
+	for i := 1; i < len(observed); i++ {
+		if observed[i].at.Sub(observed[i-1].at) < 800*time.Millisecond {
+			t.Fatalf("probe %d started too soon after probe %d: gap=%v", i, i-1, observed[i].at.Sub(observed[i-1].at))
+		}
+		if observed[i].id <= observed[i-1].id {
+			t.Fatalf("probe order=%+v, want node ID order", observed)
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && s.activeCycleStatus().Running {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if status := s.activeCycleStatus(); status.Running || status.Completed != status.Total {
+		t.Fatalf("cycle did not close cleanly: %+v", status)
+	}
+	for _, event := range s.events() {
+		if event.Event == "quality_probe_completed" && event.Trigger != qualityTriggerManual {
+			t.Fatalf("manual cycle event trigger=%q, want manual", event.Trigger)
+		}
+	}
+	cancel()
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
 	}
 }
 

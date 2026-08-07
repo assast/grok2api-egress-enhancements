@@ -75,7 +75,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.0.12"
+	pluginVersion       = "1.0.13"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -409,6 +409,24 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			return managementJSON(http.StatusOK, map[string]any{"data": store.policy(), "ok": true})
 		}
 
+	case path == "/quality-guard/full-test" || path == "/quality-guard/active-test":
+		if method != http.MethodPost {
+			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+		}
+		cycle, started := store.startManualActiveCycle()
+		result := map[string]any{
+			"started":          started,
+			"running":          cycle.Running,
+			"total":            cycle.Total,
+			"completed":        cycle.Completed,
+			"started_at":       cycle.StartedAt,
+			"interval_seconds": cycle.IntervalSec,
+		}
+		if cycle.Total == 0 && !cycle.Running {
+			result["message"] = "没有可检测的启用节点"
+		}
+		return managementJSON(http.StatusOK, map[string]any{"ok": true, "data": result})
+
 	case path == "/nodes":
 		if method == http.MethodGet {
 			refreshAssignedCounts(store)
@@ -716,6 +734,7 @@ func buildStatus() map[string]any {
 		"available":    true,
 		"updatedAt":    store.snapshot().UpdatedAt,
 		"config":       pol,
+		"active_cycle": store.activeCycleStatus(),
 		"editable":     true,
 		"nodes":        nodeMap,
 		"statistics":   st,
