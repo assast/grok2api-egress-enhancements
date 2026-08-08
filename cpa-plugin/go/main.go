@@ -74,12 +74,13 @@ import (
 )
 
 const (
-	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.0.14"
-	resourcePath        = "/status"
-	managementAPIPath   = "/v0/management/grok2api-egress/api"
-	resourceContentType = "text/html; charset=utf-8"
-	defaultStateFile    = "/CLIProxyAPI/plugin-data/egress-guard/state.json"
+	pluginName           = "grok2api-egress"
+	pluginVersion        = "1.0.14"
+	maxConnectivityNodes = 500
+	resourcePath         = "/status"
+	managementAPIPath    = "/v0/management/grok2api-egress/api"
+	resourceContentType  = "text/html; charset=utf-8"
+	defaultStateFile     = "/CLIProxyAPI/plugin-data/egress-guard/state.json"
 )
 
 //go:embed page.html
@@ -576,21 +577,49 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 		}
 
 	case path == "/nodes/test":
-		if method == http.MethodPost {
-			var raw map[string]any
-			_ = json.Unmarshal(body, &raw)
-			ids := stringIDs(raw["ids"])
-			results := make([]map[string]any, 0, len(ids))
-			for _, id := range ids {
-				r, err := runNodeConnectivity(store, id)
-				if err != nil {
-					results = append(results, map[string]any{"id": id, "error": err.Error()})
-				} else {
-					results = append(results, r)
-				}
-			}
-			return managementJSON(http.StatusOK, map[string]any{"data": results, "results": results})
+		if method != http.MethodPost {
+			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
 		}
+		var raw map[string]any
+		if len(body) == 0 || json.Unmarshal(body, &raw) != nil {
+			return managementJSON(http.StatusBadRequest, errMsg("invalidBody", "连通性检测请求无效"))
+		}
+		requestedIDs := stringIDs(raw["ids"])
+		if len(requestedIDs) == 0 || len(requestedIDs) > maxConnectivityNodes {
+			return managementJSON(http.StatusBadRequest, errMsg("invalidBody", "连通性检测节点数量需在 1 到 500 个之间"))
+		}
+		ids := make([]string, 0, len(requestedIDs))
+		for _, rawID := range requestedIDs {
+			id := strings.TrimSpace(rawID)
+			if !safeID(id) {
+				return managementJSON(http.StatusBadRequest, errMsg("invalidBody", "节点 ID 无效"))
+			}
+			ids = append(ids, id)
+		}
+		results := make([]map[string]any, 0, len(ids))
+		success, failed, changed := 0, 0, 0
+		for _, id := range ids {
+			r, err := runNodeConnectivity(store, id)
+			if err != nil {
+				failed++
+				results = append(results, map[string]any{"id": id, "status": "error", "error": err.Error()})
+				continue
+			}
+			if r["status"] == "ok" {
+				success++
+			} else {
+				failed++
+			}
+			if r["ipChanged"] == true {
+				changed++
+			}
+			results = append(results, r)
+		}
+		return managementJSON(http.StatusOK, map[string]any{
+			"data":    results,
+			"results": results,
+			"summary": map[string]int{"total": len(results), "success": success, "failed": failed, "ipChanged": changed},
+		})
 
 	case path == "/nodes/rebalance" || path == "/rebalance":
 		if method == http.MethodPost {

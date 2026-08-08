@@ -1146,6 +1146,7 @@ func runNodeConnectivity(store *stateStore, id string) (map[string]any, error) {
 	if !ok {
 		return nil, fmt.Errorf("节点不存在")
 	}
+	previousIP := strings.TrimSpace(n.ExitIP)
 	ip, ms, err := probeConnectivityFn(n.ProxyURL)
 	status := "ok"
 	if err != nil {
@@ -1162,7 +1163,14 @@ func runNodeConnectivity(store *stateStore, id string) (map[string]any, error) {
 		}
 		return nil
 	})
-	out := map[string]any{"id": id, "status": status, "exitIp": ip, "latencyMs": ms}
+	out := map[string]any{
+		"id":              id,
+		"status":          status,
+		"exitIp":          ip,
+		"previousExitIp":  previousIP,
+		"ipChanged":       previousIP != "" && ip != "" && previousIP != ip,
+		"latencyMs":       ms,
+	}
 	if err != nil {
 		out["error"] = err.Error()
 	}

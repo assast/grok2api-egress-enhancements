@@ -134,7 +134,7 @@
 
 - 总览指标（健康 / 软 / 硬 / 隔离）
 - 节点表：状态徽章、TPS、出口 IP、绑定数、隔离倒计时
-- 行内：连通测试 / 质量测试 / 编辑 / 绑定账号 / 启停
+- 行内：连通测试 / 质量测试 / 编辑 / 绑定账号 / 启停；节点多选后可批量启停、连通检测和删除
 - 策略表单、事件时间线、一键重平衡
 - 单条添加与逐行批量导入；保存后的代理 URL 不读取、不回显
 
@@ -317,7 +317,7 @@ Content-Type: application/json
 | `/nodes/import` | POST | 原子批量创建 1-500 个节点；代理 URL 不回显 |
 | `/nodes/export` | POST | 按节点 ID 顺序导出代理 URL；单次 1-500 个，普通列表仍脱敏 |
 | `/nodes/batch` | PATCH | 批量启停 |
-| `/nodes/test` | POST | 批量连通测试 |
+| `/nodes/test` | POST | 按 `ids` 顺序逐个批量连通测试（1-500 个，不按出口 IP 或节点 ID 去重；返回旧 IP、新 IP、变化标记及汇总） |
 | `/nodes/rebalance` | POST | 账号重平衡 |
 | `/nodes/{id}` | GET/PUT/DELETE | 单节点 |
 | `/nodes/{id}/test` | POST | 连通测试 |

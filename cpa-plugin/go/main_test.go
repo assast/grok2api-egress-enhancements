@@ -963,6 +963,99 @@ func TestDispatchNodesList(t *testing.T) {
 	}
 }
 
+func TestDispatchBatchNodeConnectivity(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
+	first, err := store.createNode("first", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.createNode("second", "http://127.0.0.1:7952", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(first.ID, func(node *nodeRecord) error {
+		node.ExitIP = "203.0.113.9"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	originalProbe := probeConnectivityFn
+	t.Cleanup(func() { probeConnectivityFn = originalProbe })
+	calls := make([]string, 0, 3)
+	firstProbeCount := 0
+	probeConnectivityFn = func(proxyURL string) (string, int64, error) {
+		calls = append(calls, proxyURL)
+		if proxyURL == second.ProxyURL {
+			return "", 23, fmt.Errorf("connection refused")
+		}
+		firstProbeCount++
+		if firstProbeCount == 1 {
+			return "203.0.113.10", 12, nil
+		}
+		return "203.0.113.11", 12, nil
+	}
+
+	body, _ := json.Marshal(map[string]any{"ids": []string{first.ID, second.ID, first.ID}})
+	raw, err := dispatchAPI(http.MethodPost, "/nodes/test", nil, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	var response managementResponse
+	if err := json.Unmarshal(env.Result, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("batch connectivity status=%d body=%s", response.StatusCode, response.Body)
+	}
+	var payload struct {
+		Data    []map[string]any `json:"data"`
+		Summary struct {
+			Total     int `json:"total"`
+			Success   int `json:"success"`
+			Failed    int `json:"failed"`
+			IPChanged int `json:"ipChanged"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal(response.Body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 3 || calls[0] != first.ProxyURL || calls[1] != second.ProxyURL || calls[2] != first.ProxyURL {
+		t.Fatalf("probe order=%v, want [%q %q %q]", calls, first.ProxyURL, second.ProxyURL, first.ProxyURL)
+	}
+	if len(payload.Data) != 3 || payload.Data[0]["id"] != first.ID || payload.Data[0]["status"] != "ok" || payload.Data[0]["previousExitIp"] != "203.0.113.9" || payload.Data[0]["exitIp"] != "203.0.113.10" || payload.Data[0]["ipChanged"] != true || payload.Data[1]["id"] != second.ID || payload.Data[1]["status"] != "error" || payload.Data[2]["id"] != first.ID || payload.Data[2]["exitIp"] != "203.0.113.11" || payload.Data[2]["ipChanged"] != true {
+		t.Fatalf("batch results=%v", payload.Data)
+	}
+	if payload.Summary.Total != 3 || payload.Summary.Success != 2 || payload.Summary.Failed != 1 || payload.Summary.IPChanged != 2 {
+		t.Fatalf("batch summary=%+v, want total=3 success=2 failed=1 ipChanged=2", payload.Summary)
+	}
+	if node, _ := store.getNode(first.ID); node.ProbeStatus != "ok" || node.ExitIP != "203.0.113.11" {
+		t.Fatalf("successful node state=%+v", node)
+	}
+	if node, _ := store.getNode(second.ID); node.ProbeStatus != "error" || node.ProbeLatencyMs != 23 {
+		t.Fatalf("failed node state=%+v", node)
+	}
+
+	for name, invalidIDs := range map[string][]string{
+		"empty": {},
+		"blank": {"  "},
+		"limit": make([]string, 501),
+	} {
+		invalidBody, _ := json.Marshal(map[string]any{"ids": invalidIDs})
+		invalidRaw, invalidErr := dispatchAPI(http.MethodPost, "/nodes/test", nil, invalidBody)
+		if invalidErr != nil {
+			t.Fatal(invalidErr)
+		}
+		if got := managementStatus(t, invalidRaw); got != http.StatusBadRequest {
+			t.Fatalf("%s request status=%d, want %d", name, got, http.StatusBadRequest)
+		}
+	}
+}
+
 func TestDispatchNodesExportUsesRequestedOrderAndKeepsListRedacted(t *testing.T) {
 	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
 	first, err := store.createNode("first", "http://user:first@127.0.0.1:7951", true, false, 0)

@@ -864,7 +864,18 @@
       state.selected.clear();
     }
     async function testConnectivity(ids, button) {
-      await mutate(button, () => api('/nodes/test', {method:'POST', body:{ids}}), '连通性检测完成');
+      busy(button, true);
+      try {
+        const result = await api('/nodes/test', {method:'POST', body:{ids}});
+        const results = Array.isArray(result) ? result : (result?.results || []);
+        const success = results.filter((item) => item.status === 'ok').length;
+        const failed = results.length - success;
+        const changed = results.filter((item) => item.ipChanged).length;
+        toast('连通性检测完成：成功 ' + success + ' 个，失败 ' + failed + ' 个，IP 变化 ' + changed + ' 个');
+        state.selected.clear();
+        await load(true);
+      } catch (error) { toast(error.message, 'error'); }
+      finally { busy(button, false); }
     }
     async function exportNodes(button) {
       const nodes = filteredNodes();
