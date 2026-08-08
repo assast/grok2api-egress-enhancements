@@ -1164,12 +1164,12 @@ func runNodeConnectivity(store *stateStore, id string) (map[string]any, error) {
 		return nil
 	})
 	out := map[string]any{
-		"id":              id,
-		"status":          status,
-		"exitIp":          ip,
-		"previousExitIp":  previousIP,
-		"ipChanged":       previousIP != "" && ip != "" && previousIP != ip,
-		"latencyMs":       ms,
+		"id":             id,
+		"status":         status,
+		"exitIp":         ip,
+		"previousExitIp": previousIP,
+		"ipChanged":      previousIP != "" && ip != "" && previousIP != ip,
+		"latencyMs":      ms,
 	}
 	if err != nil {
 		out["error"] = err.Error()
